@@ -7,17 +7,18 @@ import ccxt.async_support as ccxt
 
 # ==================== НАСТРОЙКИ ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 TIMEFRAME = "1h"
 HISTORY_LIMIT = 150            # Глубина истории для точного расчета Heikin Ashi
 LIVE_POLL_INTERVAL = 3         # Опрос кандидатов каждые 3 сек
 MIN_REMAINING_MINUTES = 30.0   # Вход разрешен только если до конца часа >= 30 мин
 MAX_REMAINING_MINUTES = 59.8   # Пропускаем первые 12 секунд часа для закрытия старых свечей
-MIN_BODY_PCT = 0.001           # Минимальный порог тела свечи (0.001% — защита только от 100% равенства цен)
+MIN_BODY_PCT = 0.001           # Минимальный порог тела свечи
 CONFIRM_CHECKS = 1             # Сигнал сразу при появлении нужного цвета
 
 LOG_FILE = "signals_log.csv"
+CHAT_ID_FILE = "chat_id.txt"
 
 RAW_TICKERS = [
     # Скрин 1
@@ -51,6 +52,23 @@ current_hour_ts = 0
 hourly_candidates = {}
 color_confirm_counter = {}
 sent_signals = set()
+
+
+# ==================== АВТО-СОХРАНЕНИЕ CHAT_ID ====================
+def get_target_chat_id() -> str:
+    """Возвращает TELEGRAM_CHAT_ID из настроек или автоматически сохраненный ID из файла."""
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "ВАШ_CHAT_ID" and TELEGRAM_CHAT_ID.strip():
+        return TELEGRAM_CHAT_ID.strip()
+    if os.path.exists(CHAT_ID_FILE):
+        with open(CHAT_ID_FILE, "r", encoding="utf-8") as f:
+            saved = f.read().strip()
+            if saved:
+                return saved
+    return ""
+
+def save_target_chat_id(chat_id):
+    with open(CHAT_ID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(chat_id))
 
 
 # ==================== РАБОТА С БАЗОЙ СТАТИСТИКИ (CSV) ====================
@@ -238,10 +256,15 @@ def build_inline_keyboard(signal_id: str) -> dict:
         ]
     }
 
-async def send_telegram_signal(session: aiohttp.ClientSession, data: dict):
+async def send_telegram_signal(session: aiohttp.ClientSession, data: dict) -> bool:
+    target_chat = get_target_chat_id()
+    if not target_chat:
+        print("[ОШИБКА TG] Chat ID не задан! Напишите боту /start в Telegram.", flush=True)
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": build_signal_message(data),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -251,8 +274,11 @@ async def send_telegram_signal(session: aiohttp.ClientSession, data: dict):
         async with session.post(url, json=payload, timeout=10) as resp:
             if resp.status != 200:
                 print(f"[Ошибка TG sendMessage]: {await resp.text()}", flush=True)
+                return False
+            return True
     except Exception as e:
         print(f"[Ошибка связи с Telegram]: {e}", flush=True)
+        return False
 
 async def send_telegram_file(session: aiohttp.ClientSession, chat_id: str):
     init_csv()
@@ -298,6 +324,9 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                     chat_id = msg.get("chat", {}).get("id")
                     message_id = msg.get("message_id")
 
+                    if chat_id:
+                        save_target_chat_id(chat_id)
+
                     if "|" in cb_data:
                         action, sig_id = cb_data.split("|", 1)
                         new_status = "ЗАШЕЛ" if action == "WIN" else "НЕ ЗАШЕЛ"
@@ -323,6 +352,10 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                     msg = update["message"]
                     text = msg.get("text", "").strip()
                     chat_id = msg.get("chat", {}).get("id")
+
+                    # Автоматически запоминаем Chat ID пользователя при любом сообщении
+                    if chat_id:
+                        save_target_chat_id(chat_id)
 
                     if "document" in msg:
                         doc = msg["document"]
@@ -351,18 +384,37 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                         })
                     elif text.startswith("/export"):
                         await send_telegram_file(session, chat_id)
+                    elif text.startswith("/test"):
+                        # Отправка последнего сигнала из CSV или тестового уведомления для проверки доставки
+                        test_data = {
+                            "signal_id": "TEST_0",
+                            "signal_time_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "ticker": "CYSUSDT",
+                            "direction": "LONG",
+                            "entry_price": "0.1159",
+                            "remaining_minutes": "49.5",
+                            "streak_candles": 4,
+                            "reversal_body_pct": "0.5859",
+                            "live_body_pct": "0.0288",
+                            "status": "ОЖИДАЕТ",
+                            "updated_time_utc": ""
+                        }
+                        await send_telegram_signal(session, test_data)
                     elif text.startswith("/status") or text.startswith("/start"):
                         cand_list = ", ".join(
                             [f"{k} ({v['target_dir']})" for k, v in hourly_candidates.items()]
                         ) or "нет кандидатов в этом часе"
+                        saved_cid = get_target_chat_id()
                         status_msg = (
                             f"🤖 <b>Бот Heikin Ashi (MEXC Futures 1H) активен</b>\n"
-                            f"Отслеживается пар: <b>{len(active_symbols)} из {len(RAW_TICKERS)}</b>\n"
-                            f"Кандидаты текущего часа: <b>{len(hourly_candidates)}</b>\n"
+                            f"📩 <b>Chat ID для сигналов:</b> <code>{saved_cid}</code> (подключен ✅)\n"
+                            f"📊 <b>Отслеживается пар:</b> {len(active_symbols)} из {len(RAW_TICKERS)}\n"
+                            f"🎯 <b>Кандидаты текущего часа ({len(hourly_candidates)}):</b>\n"
                             f"<code>{cand_list}</code>\n\n"
                             f"<b>Доступные команды:</b>\n"
                             f"/stats — сводка результатов и винрейт\n"
                             f"/export — скачать CSV-файл для анализа\n"
+                            f"/test — проверить доставку сигнала\n"
                             f"/status — проверить текущих кандидатов часа"
                         )
                         await session.post(f"{base_url}/sendMessage", json={
@@ -396,10 +448,6 @@ async def resolve_mexc_symbols(exchange):
 
 
 async def scan_hourly_candidates(exchange, hour_open_ts):
-    """
-    ЭТАП 1: Строго фильтрует только закрытые свечи (timestamp < hour_open_ts)
-    и проверяет, что последняя закрытая свеча относится ровно к предыдущему часу (hour_open_ts - 1h).
-    """
     candidates = {}
     hour_ms = 3600 * 1000
     prev_closed_ts = hour_open_ts - hour_ms
@@ -415,10 +463,8 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             if not ohlcv or len(ohlcv) < 10:
                 return
 
-            # Берем строго свечи, которые открылись ДО начала текущего часа
             closed_candles = [c for c in ohlcv if c[0] < hour_open_ts]
 
-            # Проверяем, что последняя закрытая свеча — это именно предыдущий час (торги не стояли)
             if len(closed_candles) < 10 or closed_candles[-1][0] != prev_closed_ts:
                 return
 
@@ -426,7 +472,6 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             reversal_candle = ha_closed[-1]
             idx_before_rev = len(ha_closed) - 2
 
-            # Кандидат в SHORT: минимум 3 зеленые -> 1 закрытая красная
             if reversal_candle["color"] == "RED":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "GREEN")
                 if streak >= 3:
@@ -437,7 +482,6 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
                         "rev_body_pct": reversal_candle["body_pct"]
                     }
 
-            # Кандидат в LONG: минимум 3 красные -> 1 закрытая зеленая
             elif reversal_candle["color"] == "GREEN":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "RED")
                 if streak >= 3:
@@ -453,9 +497,6 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
 
 
 async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms, hour_open_ts, rem_min):
-    """
-    ЭТАП 2: Быстрый мониторинг живой свечи для отобранных кандидатов часа.
-    """
     if (ticker, hour_open_ts) in sent_signals:
         return
 
@@ -468,8 +509,6 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
     if not ohlcv:
         return
 
-    # Если биржа еще не сформировала свечу нового часа, берем текущую рыночную цену
-    # и строим живую свечу Heikin Ashi относительно последней закрытой
     ha_candles = calculate_heikin_ashi(ohlcv)
     live_candle = ha_candles[-1]
 
@@ -483,7 +522,6 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
         return
 
     if color_confirm_counter[ticker] >= CONFIRM_CHECKS:
-        sent_signals.add((ticker, hour_open_ts))
         dt_str = datetime.datetime.fromtimestamp(
             server_time_ms / 1000.0, tz=datetime.timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S")
@@ -503,9 +541,12 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
             "updated_time_utc": dt_str
         }
 
-        log_new_signal(signal_data)
-        await send_telegram_signal(session, signal_data)
-        print(f"[СИГНАЛ] {ticker} -> {info['target_dir']} | Цена: {live_candle['real_close']} | Осталось: {rem_min:.1f} мин.", flush=True)
+        # Сначала отправляем в Telegram, и только при успехе помечаем сигнал отправленным
+        sent_ok = await send_telegram_signal(session, signal_data)
+        if sent_ok:
+            sent_signals.add((ticker, hour_open_ts))
+            log_new_signal(signal_data)
+            print(f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {info['target_dir']} | Цена: {live_candle['real_close']}", flush=True)
 
 
 # ==================== ТОЧКА ВХОДА ====================
@@ -532,7 +573,6 @@ async def main():
                     hour_close_ts = hour_open_ts + hour_ms
                     remaining_minutes = (hour_close_ts - server_time_ms) / 60000.0
 
-                    # Сканируем кандидатов при смене часа (когда прошло хотя бы 12 сек нового часа)
                     if hour_open_ts != current_hour_ts and remaining_minutes <= MAX_REMAINING_MINUTES:
                         current_hour_ts = hour_open_ts
                         color_confirm_counter.clear()
