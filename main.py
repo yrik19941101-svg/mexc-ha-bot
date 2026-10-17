@@ -5,8 +5,7 @@ import os
 import aiohttp
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ BOTHOST) ====================
-# Можно задать в разделе "Переменные окружения" (Env) на Bothost или вписать ниже напрямую
+# ==================== НАСТРОЙКИ ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
 
@@ -14,13 +13,12 @@ TIMEFRAME = "1h"
 HISTORY_LIMIT = 150            # Глубина истории для точного расчета Heikin Ashi
 LIVE_POLL_INTERVAL = 3         # Опрос кандидатов каждые 3 сек
 MIN_REMAINING_MINUTES = 30.0   # Вход разрешен только если до конца часа >= 30 мин
-MAX_REMAINING_MINUTES = 59.5   # Пропускаем первые 30 секунд часа (защита от шума открытия)
-MIN_BODY_PCT = 0.02            # Минимальный размер тела свечи Heikin Ashi в % (защита от Доджи)
-CONFIRM_CHECKS = 2             # Сколько проверок подряд должен держаться цвет живой свечи
+MAX_REMAINING_MINUTES = 59.8   # Пропускаем первые 12 секунд часа для закрытия старых свечей
+MIN_BODY_PCT = 0.001           # Минимальный порог тела свечи (0.001% — защита только от 100% равенства цен)
+CONFIRM_CHECKS = 1             # Сигнал сразу при появлении нужного цвета
 
 LOG_FILE = "signals_log.csv"
 
-# Полный список из 84 торговых пар со скриншотов (Зона 0 комиссий USDT-M)
 RAW_TICKERS = [
     # Скрин 1
     "BTWUSDT", "ZECUSDT", "TAOUSDT", "LINKUSDT", "ONDOUSDT", "AKEUSDT", "ADAUSDT",
@@ -48,12 +46,11 @@ RAW_TICKERS = [
     "NICKEL(XNI)USDT", "LAYERUSDT", "ALUMINIUM(XAL)USDT", "LEAD(XPB)USDT", "ZINC(XZN)USDT", "ACNUSDT", "AKAMUSDT",
 ]
 
-# Глобальные состояния
-active_symbols = {}          # {raw_ticker: ccxt_symbol}
-current_hour_ts = 0          # Метка времени текущего часа
-hourly_candidates = {}       # {raw_ticker: {"target_dir": "SHORT"/"LONG", "streak": int, "rev_body_pct": float}}
-color_confirm_counter = {}   # {raw_ticker: int} — счетчик подтверждений цвета живой свечи
-sent_signals = set()         # {(raw_ticker, candle_open_ts)}
+active_symbols = {}
+current_hour_ts = 0
+hourly_candidates = {}
+color_confirm_counter = {}
+sent_signals = set()
 
 
 # ==================== РАБОТА С БАЗОЙ СТАТИСТИКИ (CSV) ====================
@@ -181,7 +178,6 @@ def calculate_heikin_ashi(ohlcv):
 
 
 def count_consecutive_color(ha_candles, start_index, target_color):
-    """Считает подряд идущие свечи одного цвета назад от start_index."""
     count = 0
     for i in range(start_index, -1, -1):
         if ha_candles[i]["color"] == target_color:
@@ -254,9 +250,9 @@ async def send_telegram_signal(session: aiohttp.ClientSession, data: dict):
     try:
         async with session.post(url, json=payload, timeout=10) as resp:
             if resp.status != 200:
-                print(f"[Ошибка TG sendMessage]: {await resp.text()}")
+                print(f"[Ошибка TG sendMessage]: {await resp.text()}", flush=True)
     except Exception as e:
-        print(f"[Ошибка связи с Telegram]: {e}")
+        print(f"[Ошибка связи с Telegram]: {e}", flush=True)
 
 async def send_telegram_file(session: aiohttp.ClientSession, chat_id: str):
     init_csv()
@@ -269,18 +265,17 @@ async def send_telegram_file(session: aiohttp.ClientSession, chat_id: str):
     form.add_field(
         "caption",
         "📁 Файл статистики сигналов.\n"
-        "Отправь его для анализа или перешли обратно боту, если нужно восстановить базу после редеплоя."
+        "Отправь его для анализа или перешли обратно боту для восстановления базы."
     )
     form.add_field("document", file_bytes, filename="signals_log.csv", content_type="text/csv")
     try:
         async with session.post(url, data=form, timeout=20) as resp:
             if resp.status != 200:
-                print(f"[Ошибка отправки файла TG]: {await resp.text()}")
+                print(f"[Ошибка отправки файла TG]: {await resp.text()}", flush=True)
     except Exception as e:
-        print(f"[Ошибка отправки файла]: {e}")
+        print(f"[Ошибка отправки файла]: {e}", flush=True)
 
 async def telegram_polling_worker(session: aiohttp.ClientSession):
-    """Обработчик кнопок 'Зашел / Не зашел', команд /stats, /export, /status и загрузки бекапа CSV."""
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -295,7 +290,6 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
 
-                # 1. Нажатие на кнопки под сигналом
                 if "callback_query" in update:
                     cb = update["callback_query"]
                     cb_id = cb["id"]
@@ -325,13 +319,11 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                             "text": f"Отмечено: {new_status}"
                         })
 
-                # 2. Команды и восстановление базы из файла
                 elif "message" in update:
                     msg = update["message"]
                     text = msg.get("text", "").strip()
                     chat_id = msg.get("chat", {}).get("id")
 
-                    # Если пользователь прислал CSV-файл для восстановления базы после пересборки на Bothost
                     if "document" in msg:
                         doc = msg["document"]
                         if doc.get("file_name", "").endswith(".csv"):
@@ -380,13 +372,12 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"[Ошибка поллинга TG]: {e}")
+            print(f"[Ошибка поллинга TG]: {e}", flush=True)
             await asyncio.sleep(5)
 
 
 # ==================== СКАНИРОВАНИЕ MEXC FUTURES ====================
 async def resolve_mexc_symbols(exchange):
-    """Сопоставляет список из 84 тикеров с контрактами MEXC Swap (USDT-M)."""
     markets = await exchange.load_markets()
     resolved = {}
 
@@ -396,23 +387,18 @@ async def resolve_mexc_symbols(exchange):
             raw_id = m.get("id", "").replace("_", "")
             id_map[raw_id] = sym
 
-    missing = []
     for ticker in RAW_TICKERS:
         if ticker in id_map:
             resolved[ticker] = id_map[ticker]
-        else:
-            missing.append(ticker)
 
-    print(f"[Инициализация] Найдено пар на MEXC Futures: {len(resolved)} из {len(RAW_TICKERS)}")
-    if missing:
-        print(f"[Внимание] Не найдены или делистнуты пары: {missing}")
+    print(f"[Инициализация] Найдено пар на MEXC Futures: {len(resolved)} из {len(RAW_TICKERS)}", flush=True)
     return resolved
 
 
 async def scan_hourly_candidates(exchange, hour_open_ts):
     """
-    ЭТАП 1: В начале часа проверяет все 84 пары и отбирает те, где закрытые свечи
-    выполнили Условие 1 (3+ свечи одного цвета) и Условие 2 (1 закрытая разворотная свеча).
+    ЭТАП 1: Строго фильтрует только закрытые свечи (timestamp < hour_open_ts)
+    и проверяет, что последняя закрытая свеча относится ровно к предыдущему часу (hour_open_ts - 1h).
     """
     candidates = {}
     hour_ms = 3600 * 1000
@@ -429,14 +415,11 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             if not ohlcv or len(ohlcv) < 10:
                 return
 
-            if ohlcv[-1][0] == hour_open_ts:
-                closed_candles = ohlcv[:-1]
-            elif ohlcv[-1][0] == prev_closed_ts:
-                closed_candles = ohlcv
-            else:
-                return
+            # Берем строго свечи, которые открылись ДО начала текущего часа
+            closed_candles = [c for c in ohlcv if c[0] < hour_open_ts]
 
-            if len(closed_candles) < 6 or closed_candles[-1][0] != prev_closed_ts:
+            # Проверяем, что последняя закрытая свеча — это именно предыдущий час (торги не стояли)
+            if len(closed_candles) < 10 or closed_candles[-1][0] != prev_closed_ts:
                 return
 
             ha_closed = calculate_heikin_ashi(closed_candles)
@@ -482,11 +465,16 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
     except Exception:
         return
 
-    if not ohlcv or ohlcv[-1][0] != hour_open_ts:
+    if not ohlcv:
         return
 
+    # Если биржа еще не сформировала свечу нового часа, берем текущую рыночную цену
+    # и строим живую свечу Heikin Ashi относительно последней закрытой
     ha_candles = calculate_heikin_ashi(ohlcv)
     live_candle = ha_candles[-1]
+
+    if live_candle["timestamp"] != hour_open_ts:
+        return
 
     if live_candle["color"] == info["target_live_color"]:
         color_confirm_counter[ticker] = color_confirm_counter.get(ticker, 0) + 1
@@ -517,7 +505,7 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
 
         log_new_signal(signal_data)
         await send_telegram_signal(session, signal_data)
-        print(f"[СИГНАЛ] {ticker} -> {info['target_dir']} | Цена: {live_candle['real_close']} | Осталось: {rem_min:.1f} мин.")
+        print(f"[СИГНАЛ] {ticker} -> {info['target_dir']} | Цена: {live_candle['real_close']} | Осталось: {rem_min:.1f} мин.", flush=True)
 
 
 # ==================== ТОЧКА ВХОДА ====================
@@ -534,7 +522,7 @@ async def main():
         active_symbols = await resolve_mexc_symbols(exchange)
         tg_task = asyncio.create_task(telegram_polling_worker(session))
 
-        print("Бот успешно запущен на хостинге и отслеживает рынок...")
+        print("Бот успешно запущен на хостинге и отслеживает рынок...", flush=True)
         try:
             while True:
                 try:
@@ -544,12 +532,13 @@ async def main():
                     hour_close_ts = hour_open_ts + hour_ms
                     remaining_minutes = (hour_close_ts - server_time_ms) / 60000.0
 
-                    if hour_open_ts != current_hour_ts and remaining_minutes <= 59.9:
+                    # Сканируем кандидатов при смене часа (когда прошло хотя бы 12 сек нового часа)
+                    if hour_open_ts != current_hour_ts and remaining_minutes <= MAX_REMAINING_MINUTES:
                         current_hour_ts = hour_open_ts
                         color_confirm_counter.clear()
-                        print(f"\n[Новый час] Сканирование всех {len(active_symbols)} пар...")
+                        print(f"\n[Новый час] Сканирование всех {len(active_symbols)} пар...", flush=True)
                         hourly_candidates = await scan_hourly_candidates(exchange, hour_open_ts)
-                        print(f"[Кандидаты часа] Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}")
+                        print(f"[Кандидаты часа] Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}", flush=True)
 
                     if MIN_REMAINING_MINUTES <= remaining_minutes <= MAX_REMAINING_MINUTES and hourly_candidates:
                         tasks = [
@@ -564,7 +553,7 @@ async def main():
                             await asyncio.gather(*tasks)
 
                 except Exception as loop_err:
-                    print(f"[Ошибка основного цикла]: {loop_err}")
+                    print(f"[Ошибка основного цикла]: {loop_err}", flush=True)
 
                 await asyncio.sleep(LIVE_POLL_INTERVAL)
         finally:
