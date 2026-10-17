@@ -14,8 +14,13 @@ HISTORY_LIMIT = 150            # Глубина истории для точно
 LIVE_POLL_INTERVAL = 3         # Опрос кандидатов каждые 3 сек
 MIN_REMAINING_MINUTES = 30.0   # Вход разрешен только если до конца часа >= 30 мин
 MAX_REMAINING_MINUTES = 59.8   # Пропускаем первые 12 секунд часа для закрытия старых свечей
-MIN_BODY_PCT = 0.001           # Минимальный порог тела свечи
-CONFIRM_CHECKS = 1             # Сигнал сразу при появлении нужного цвета
+MIN_BODY_PCT = 0.001           # Минимальный порог тела свечи HA
+CONFIRM_CHECKS = 1             # Подтверждение условия (1 проверка = сразу)
+
+# --- НАСТРОЙКИ ВХОДА ПО ОТКАТУ (БЕЗ ОБЯЗАТЕЛЬНОЙ СМЕНЫ ЦВЕТА HA) ---
+PULLBACK_RETRACE_RATIO = 0.35  # Откат на 35% от размера предыдущей разворотной свечи
+MIN_PULLBACK_PCT = 0.15        # Минимальный откат реальной цены в % от открытия часа (чтобы не входить на микро-шуме)
+DIRECT_PULLBACK_PCT = 0.35     # Безусловный откат в % от открытия часа (даже если прошлая свеча была огромной)
 
 LOG_FILE = "signals_log.csv"
 CHAT_ID_FILE = "chat_id.txt"
@@ -50,13 +55,12 @@ RAW_TICKERS = [
 active_symbols = {}
 current_hour_ts = 0
 hourly_candidates = {}
-color_confirm_counter = {}
+trigger_confirm_counter = {}
 sent_signals = set()
 
 
 # ==================== АВТО-СОХРАНЕНИЕ CHAT_ID ====================
 def get_target_chat_id() -> str:
-    """Возвращает TELEGRAM_CHAT_ID из настроек или автоматически сохраненный ID из файла."""
     if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "ВАШ_CHAT_ID" and TELEGRAM_CHAT_ID.strip():
         return TELEGRAM_CHAT_ID.strip()
     if os.path.exists(CHAT_ID_FILE):
@@ -75,7 +79,7 @@ def save_target_chat_id(chat_id):
 CSV_HEADERS = [
     "signal_id", "signal_time_utc", "ticker", "direction", "entry_price",
     "remaining_minutes", "streak_candles", "reversal_body_pct", "live_body_pct",
-    "status", "updated_time_utc"
+    "trigger_reason", "status", "updated_time_utc"
 ]
 
 def init_csv():
@@ -87,7 +91,7 @@ def init_csv():
 def log_new_signal(data: dict):
     init_csv()
     with open(LOG_FILE, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
         writer.writerow(data)
 
 def update_signal_status(signal_id: str, new_status: str) -> dict | None:
@@ -99,6 +103,8 @@ def update_signal_status(signal_id: str, new_status: str) -> dict | None:
     with open(LOG_FILE, mode="r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            if "trigger_reason" not in row or not row["trigger_reason"]:
+                row["trigger_reason"] = "Смена цвета HA"
             if row["signal_id"] == signal_id:
                 row["status"] = new_status
                 row["updated_time_utc"] = now_str
@@ -107,7 +113,7 @@ def update_signal_status(signal_id: str, new_status: str) -> dict | None:
 
     if updated_row:
         with open(LOG_FILE, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
 
@@ -126,8 +132,8 @@ def get_stats_summary() -> str:
         reader = csv.DictReader(f)
         for row in reader:
             total += 1
-            st = row["status"]
-            d = row["direction"]
+            st = row.get("status", "")
+            d = row.get("direction", "")
             if st == "ЗАШЕЛ":
                 win += 1
                 if d == "LONG":
@@ -188,6 +194,9 @@ def calculate_heikin_ashi(ohlcv):
             "ha_high": ha_high,
             "ha_low": ha_low,
             "ha_close": ha_close,
+            "real_open": o,
+            "real_high": h,
+            "real_low": l,
             "real_close": c,
             "body_pct": body_pct,
             "color": color
@@ -215,6 +224,7 @@ def build_signal_message(data: dict) -> str:
     streak = int(data["streak_candles"])
     rev_pct = float(data["reversal_body_pct"])
     live_pct = float(data["live_body_pct"])
+    trigger_reason = data.get("trigger_reason", "Смена цвета HA")
     status = data["status"]
 
     mexc_pair = ticker[:-4] + "_USDT"
@@ -222,10 +232,10 @@ def build_signal_message(data: dict) -> str:
 
     if direction == "SHORT":
         header = "🔴 <b>СИГНАЛ: SHORT (ВНИЗ)</b>"
-        chain = f"{'🟢' * min(streak, 6)} ({streak} закр.) ➔ 🔴 (1 закр.) ➔ 🟢 (живая)"
+        chain = f"{'🟢' * min(streak, 6)} ({streak} закр.) ➔ 🔴 (1 закр.) ➔ ⚡ Вход ({trigger_reason})"
     else:
         header = "🟢 <b>СИГНАЛ: LONG (ВВЕРХ)</b>"
-        chain = f"{'🔴' * min(streak, 6)} ({streak} закр.) ➔ 🟢 (1 закр.) ➔ 🔴 (живая)"
+        chain = f"{'🔴' * min(streak, 6)} ({streak} закр.) ➔ 🟢 (1 закр.) ➔ ⚡ Вход ({trigger_reason})"
 
     if status == "ЗАШЕЛ":
         status_line = "✅ <b>Результат: СИГНАЛ ЗАШЕЛ</b>"
@@ -238,11 +248,12 @@ def build_signal_message(data: dict) -> str:
         f"{header}\n\n"
         f"📌 <b>Пара:</b> <code>{ticker}</code> (<a href='{chart_url}'>Открыть график</a>)\n"
         f"💰 <b>Цена входа:</b> <code>{price}</code>\n"
+        f"🎯 <b>Триггер входа:</b> {trigger_reason}\n"
         f"🕒 <b>Время (MEXC):</b> {dt_str} UTC\n"
         f"⏱ <b>До закрытия 1H свечи:</b> {rem_min:.1f} мин.\n\n"
         f"📊 <b>Цепочка Heikin Ashi (1H):</b>\n{chain}\n"
         f"▪️ Тело разворотной свечи: {rev_pct:.3f}%\n"
-        f"▪️ Тело живой свечи: {live_pct:.3f}%\n\n"
+        f"▪️ Тело живой свечи HA: {live_pct:.3f}%\n\n"
         f"{status_line}"
     )
 
@@ -353,7 +364,6 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                     text = msg.get("text", "").strip()
                     chat_id = msg.get("chat", {}).get("id")
 
-                    # Автоматически запоминаем Chat ID пользователя при любом сообщении
                     if chat_id:
                         save_target_chat_id(chat_id)
 
@@ -385,17 +395,17 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                     elif text.startswith("/export"):
                         await send_telegram_file(session, chat_id)
                     elif text.startswith("/test"):
-                        # Отправка последнего сигнала из CSV или тестового уведомления для проверки доставки
                         test_data = {
                             "signal_id": "TEST_0",
                             "signal_time_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "ticker": "CYSUSDT",
-                            "direction": "LONG",
-                            "entry_price": "0.1159",
-                            "remaining_minutes": "49.5",
-                            "streak_candles": 4,
-                            "reversal_body_pct": "0.5859",
-                            "live_body_pct": "0.0288",
+                            "ticker": "BLESSUSDT",
+                            "direction": "SHORT",
+                            "entry_price": "0.007507",
+                            "remaining_minutes": "46.1",
+                            "streak_candles": 3,
+                            "reversal_body_pct": "0.6200",
+                            "live_body_pct": "0.1800",
+                            "trigger_reason": "Откат цены +0.28%",
                             "status": "ОЖИДАЕТ",
                             "updated_time_utc": ""
                         }
@@ -406,7 +416,7 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                         ) or "нет кандидатов в этом часе"
                         saved_cid = get_target_chat_id()
                         status_msg = (
-                            f"🤖 <b>Бот Heikin Ashi (MEXC Futures 1H) активен</b>\n"
+                            f"🤖 <b>Бот Heikin Ashi + Pullback (MEXC 1H) активен</b>\n"
                             f"📩 <b>Chat ID для сигналов:</b> <code>{saved_cid}</code> (подключен ✅)\n"
                             f"📊 <b>Отслеживается пар:</b> {len(active_symbols)} из {len(RAW_TICKERS)}\n"
                             f"🎯 <b>Кандидаты текущего часа ({len(hourly_candidates)}):</b>\n"
@@ -472,6 +482,13 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             reversal_candle = ha_closed[-1]
             idx_before_rev = len(ha_closed) - 2
 
+            # Реальный размах и тело предыдущей разворотной свечи
+            rev_real_range = max(
+                abs(reversal_candle["real_open"] - reversal_candle["real_close"]),
+                abs(reversal_candle["ha_open"] - reversal_candle["ha_close"])
+            )
+
+            # Кандидат в SHORT: минимум 3 зеленые -> 1 закрытая красная
             if reversal_candle["color"] == "RED":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "GREEN")
                 if streak >= 3:
@@ -479,9 +496,12 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
                         "target_dir": "SHORT",
                         "target_live_color": "GREEN",
                         "streak": streak,
-                        "rev_body_pct": reversal_candle["body_pct"]
+                        "rev_body_pct": reversal_candle["body_pct"],
+                        "rev_close_price": reversal_candle["real_close"],
+                        "rev_range": rev_real_range
                     }
 
+            # Кандидат в LONG: минимум 3 красные -> 1 закрытая зеленая
             elif reversal_candle["color"] == "GREEN":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "RED")
                 if streak >= 3:
@@ -489,7 +509,9 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
                         "target_dir": "LONG",
                         "target_live_color": "RED",
                         "streak": streak,
-                        "rev_body_pct": reversal_candle["body_pct"]
+                        "rev_body_pct": reversal_candle["body_pct"],
+                        "rev_close_price": reversal_candle["real_close"],
+                        "rev_range": rev_real_range
                     }
 
     await asyncio.gather(*(check_one(t, s) for t, s in active_symbols.items()))
@@ -515,13 +537,46 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
     if live_candle["timestamp"] != hour_open_ts:
         return
 
+    current_price = live_candle["real_close"]
+    open_price = live_candle["real_open"]
+    rev_range = info["rev_range"]
+    target_dir = info["target_dir"]
+
+    trigger_reason = None
+
+    # 1. ПРОВЕРКА УСЛОВИЯ А: Смена цвета свечи Heikin Ashi
     if live_candle["color"] == info["target_live_color"]:
-        color_confirm_counter[ticker] = color_confirm_counter.get(ticker, 0) + 1
+        trigger_reason = f"Смена цвета HA ({live_candle['color']})"
+
+    # 2. ПРОВЕРКА УСЛОВИЯ Б: Хороший откат реальной цены на живой свече (даже без смены цвета HA)
     else:
-        color_confirm_counter[ticker] = 0
+        if target_dir == "SHORT" and current_price > open_price:
+            # Для SHORT ищем откат цены ВВЕРХ от открытия текущего часа (или от минимума свечи)
+            base_price = min(open_price, live_candle["real_low"])
+            pullback_abs = current_price - base_price
+            pullback_pct = (pullback_abs / base_price) * 100.0 if base_price > 0 else 0.0
+            retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
+
+            if (retrace_ratio >= PULLBACK_RETRACE_RATIO and pullback_pct >= MIN_PULLBACK_PCT) or (pullback_pct >= DIRECT_PULLBACK_PCT):
+                trigger_reason = f"Откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% от пред. свечи)"
+
+        elif target_dir == "LONG" and current_price < open_price:
+            # Для LONG ищем откат цены ВНИЗ от открытия текущего часа (или от максимума свечи)
+            base_price = max(open_price, live_candle["real_high"])
+            pullback_abs = base_price - current_price
+            pullback_pct = (pullback_abs / base_price) * 100.0 if base_price > 0 else 0.0
+            retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
+
+            if (retrace_ratio >= PULLBACK_RETRACE_RATIO and pullback_pct >= MIN_PULLBACK_PCT) or (pullback_pct >= DIRECT_PULLBACK_PCT):
+                trigger_reason = f"Откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% от пред. свечи)"
+
+    if trigger_reason:
+        trigger_confirm_counter[ticker] = trigger_confirm_counter.get(ticker, 0) + 1
+    else:
+        trigger_confirm_counter[ticker] = 0
         return
 
-    if color_confirm_counter[ticker] >= CONFIRM_CHECKS:
+    if trigger_confirm_counter[ticker] >= CONFIRM_CHECKS:
         dt_str = datetime.datetime.fromtimestamp(
             server_time_ms / 1000.0, tz=datetime.timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S")
@@ -531,27 +586,27 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
             "signal_id": signal_id,
             "signal_time_utc": dt_str,
             "ticker": ticker,
-            "direction": info["target_dir"],
-            "entry_price": live_candle["real_close"],
+            "direction": target_dir,
+            "entry_price": current_price,
             "remaining_minutes": f"{rem_min:.1f}",
             "streak_candles": info["streak"],
             "reversal_body_pct": f"{info['rev_body_pct']:.4f}",
             "live_body_pct": f"{live_candle['body_pct']:.4f}",
+            "trigger_reason": trigger_reason,
             "status": "ОЖИДАЕТ",
             "updated_time_utc": dt_str
         }
 
-        # Сначала отправляем в Telegram, и только при успехе помечаем сигнал отправленным
         sent_ok = await send_telegram_signal(session, signal_data)
         if sent_ok:
             sent_signals.add((ticker, hour_open_ts))
             log_new_signal(signal_data)
-            print(f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {info['target_dir']} | Цена: {live_candle['real_close']}", flush=True)
+            print(f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {target_dir} | {trigger_reason} | Цена: {current_price}", flush=True)
 
 
 # ==================== ТОЧКА ВХОДА ====================
 async def main():
-    global active_symbols, current_hour_ts, hourly_candidates, color_confirm_counter
+    global active_symbols, current_hour_ts, hourly_candidates, trigger_confirm_counter
 
     init_csv()
     exchange = ccxt.mexc({
@@ -575,7 +630,7 @@ async def main():
 
                     if hour_open_ts != current_hour_ts and remaining_minutes <= MAX_REMAINING_MINUTES:
                         current_hour_ts = hour_open_ts
-                        color_confirm_counter.clear()
+                        trigger_confirm_counter.clear()
                         print(f"\n[Новый час] Сканирование всех {len(active_symbols)} пар...", flush=True)
                         hourly_candidates = await scan_hourly_candidates(exchange, hour_open_ts)
                         print(f"[Кандидаты часа] Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}", flush=True)
