@@ -14,14 +14,14 @@ HISTORY_LIMIT = 150
 LIVE_POLL_INTERVAL = 3
 MIN_REMAINING_MINUTES = 30.0
 SCAN_MAX_REMAINING_MIN = 59.75
-ENTRY_MAX_REMAINING_MIN = 58.5
+ENTRY_MAX_REMAINING_MIN = 57.5  # Ждем первые 2.5 минуты часа для формирования глубокого отката
 MIN_BODY_PCT = 0.005
-CONFIRM_CHECKS = 2
+CONFIRM_CHECKS = 3              # Удержание уровня отката минимум 3 проверки подряд (~9 сек)
 
-# --- НАСТРОЙКИ НАСТОЯЩЕГО ОТКАТА ОТ ОТКРЫТИЯ ЧАСА ---
-PULLBACK_RETRACE_RATIO = 0.40
-MIN_PULLBACK_PCT = 0.35
-DIRECT_PULLBACK_PCT = 0.65
+# --- НАСТРОЙКИ ГЛУБОКОГО ОТКАТА ОТ ОТКРЫТИЯ ЧАСА ---
+PULLBACK_RETRACE_RATIO = 0.70   # Откат минимум 70% от размаха предыдущей свечи (или среднего размаха)
+MIN_PULLBACK_PCT = 0.85         # Обязательный минимальный откат от открытия часа не менее 0.85%
+DIRECT_PULLBACK_PCT = 1.40      # Безусловный глубокий откат от открытия часа (1.40%+)
 
 LOG_FILE = "signals_log.csv"
 CHAT_ID_FILE = "chat_id.txt"
@@ -222,7 +222,7 @@ def build_signal_message(data: dict) -> str:
     streak = int(data["streak_candles"])
     rev_pct = float(data["reversal_body_pct"])
     live_pct = float(data["live_body_pct"])
-    trigger_reason = data.get("trigger_reason", "Откат + HA")
+    trigger_reason = data.get("trigger_reason", "Глубокий откат")
     status = data["status"]
 
     mexc_pair = ticker[:-4] + "_USDT"
@@ -403,8 +403,9 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                         ) or "нет кандидатов в этом часе"
                         saved_cid = get_target_chat_id()
                         status_lines = [
-                            "🤖 <b>Бот Heikin Ashi + True Pullback активен</b>",
+                            "🤖 <b>Бот Heikin Ashi + Deep Pullback активен</b>",
                             f"📩 <b>Chat ID:</b> <code>{saved_cid}</code> (подключен ✅)",
+                            f"⚙️ <b>Мин. откат:</b> {MIN_PULLBACK_PCT}% (или {int(PULLBACK_RETRACE_RATIO*100)}% свечи)",
                             f"📊 <b>Пар:</b> {len(active_symbols)} из {len(RAW_TICKERS)}",
                             f"🎯 <b>Кандидаты ({len(hourly_candidates)}):</b>",
                             f"<code>{cand_list}</code>"
@@ -466,9 +467,14 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             reversal_candle = ha_closed[-1]
             idx_before_rev = len(ha_closed) - 2
 
+            # Берем максимум между телом разворотной свечи и средним размахом последних 5 свечей,
+            # чтобы маленькая разворотная свеча не давала слишком ранний вход
+            recent_ranges = [abs(c["real_high"] - c["real_low"]) for c in ha_closed[-5:]]
+            avg_recent_range = sum(recent_ranges) / len(recent_ranges)
             rev_real_range = max(
                 abs(reversal_candle["real_open"] - reversal_candle["real_close"]),
-                abs(reversal_candle["ha_open"] - reversal_candle["ha_close"])
+                abs(reversal_candle["ha_open"] - reversal_candle["ha_close"]),
+                avg_recent_range * 0.6
             )
 
             if reversal_candle["color"] == "RED":
@@ -530,22 +536,20 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
         pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
         retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        if pullback_pct >= MIN_PULLBACK_PCT:
-            if live_candle["color"] == "GREEN":
-                trigger_reason = f"Зеленая HA + откат вверх +{pullback_pct:.2f}%"
-            elif retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT:
-                trigger_reason = f"Откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% от пред. свечи)"
+        # Обязательное условие: откат вверх минимум MIN_PULLBACK_PCT (0.85%) И (70% от размаха ИЛИ 1.40% чистого движения)
+        if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
+            ha_tag = "Зеленая HA + " if live_candle["color"] == "GREEN" else ""
+            trigger_reason = f"{ha_tag}Глубокий откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
 
     elif target_dir == "LONG" and current_price < open_price:
         pullback_abs = open_price - current_price
         pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
         retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        if pullback_pct >= MIN_PULLBACK_PCT:
-            if live_candle["color"] == "RED":
-                trigger_reason = f"Красная HA + откат вниз -{pullback_pct:.2f}%"
-            elif retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT:
-                trigger_reason = f"Откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% от пред. свечи)"
+        # Обязательное условие: откат вниз минимум MIN_PULLBACK_PCT (0.85%) И (70% от размаха ИЛИ 1.40% чистого движения)
+        if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
+            ha_tag = "Красная HA + " if live_candle["color"] == "RED" else ""
+            trigger_reason = f"{ha_tag}Глубокий откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
 
     if trigger_reason:
         trigger_confirm_counter[ticker] = trigger_confirm_counter.get(ticker, 0) + 1
