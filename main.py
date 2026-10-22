@@ -10,47 +10,49 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_БОТА
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 TIMEFRAME = "1h"
-HISTORY_LIMIT = 150
-LIVE_POLL_INTERVAL = 3
-MIN_REMAINING_MINUTES = 30.0
-SCAN_MAX_REMAINING_MIN = 59.75
+HISTORY_LIMIT = 120             # Достаточно для точного EMA(50), RSI(14) и Heikin Ashi
+LIVE_POLL_INTERVAL = 4          # Опрос кандидатов каждые 4 сек
+MIN_REMAINING_MINUTES = 30.0    # Вход разрешен только если до конца часа >= 30 мин
+SCAN_MAX_REMAINING_MIN = 59.75  # Сканируем рынок через 15 секунд после начала часа
 ENTRY_MAX_REMAINING_MIN = 57.5  # Ждем первые 2.5 минуты часа для формирования глубокого отката
 MIN_BODY_PCT = 0.005
-CONFIRM_CHECKS = 3              # Удержание уровня отката минимум 3 проверки подряд (~9 сек)
+CONFIRM_CHECKS = 3              # Удержание уровня отката минимум 3 проверки подряд
+
+# Параллельность запросов к MEXC (15 одновременных запросов позволяют проверить ~600 пар за ~25 сек)
+SCAN_CONCURRENCY = 15
+LIVE_CONCURRENCY = 10
 
 # --- НАСТРОЙКИ ГЛУБОКОГО ОТКАТА ОТ ОТКРЫТИЯ ЧАСА ---
 PULLBACK_RETRACE_RATIO = 0.70   # Откат минимум 70% от размаха предыдущей свечи (или среднего размаха)
 MIN_PULLBACK_PCT = 0.85         # Обязательный минимальный откат от открытия часа не менее 0.85%
 DIRECT_PULLBACK_PCT = 1.40      # Безусловный глубокий откат от открытия часа (1.40%+)
 
+# --- НАСТРОЙКИ ФИЛЬТРА ТРЕНДА (EMA) И ПЕРЕКУПЛЕННОСТИ (RSI) ---
+EMA_PERIOD = 50
+RSI_PERIOD = 14
+
+# Пороги для SHORT:
+RSI_SHORT_TREND = 55.0          # Если идем ПО ТРЕНДУ вниз (цена ниже EMA 50), достаточно RSI >= 55
+RSI_SHORT_OVERBOUGHT = 68.0     # Если идем ПРОТИВ тренда, нужна сильная перекупленность RSI >= 68
+
+# Пороги для LONG:
+RSI_LONG_TREND = 45.0           # Если идем ПО ТРЕНДУ вверх (цена выше EMA 50), достаточно RSI <= 45
+RSI_LONG_OVERSOLD = 32.0        # Если идем ПРОТИВ тренда, нужна сильная перепроданность RSI <= 32
+
 LOG_FILE = "signals_log.csv"
 CHAT_ID_FILE = "chat_id.txt"
-
-RAW_TICKERS = [
-    "BTWUSDT", "ZECUSDT", "TAOUSDT", "LINKUSDT", "ONDOUSDT", "AKEUSDT", "ADAUSDT",
-    "INJUSDT", "OPUSDT", "LTCUSDT", "AAVEUSDT", "FILUSDT", "HBARUSDT", "APTUSDT",
-    "ICPUSDT", "XLMUSDT", "XPLUSDT", "JTOUSDT", "RIVERUSDT", "ATOMUSDT", "SHIBUSDT",
-    "ASTERUSDT", "PONSUSDT", "龙虾USDT", "LABUSDT", "DASHUSDT", "VVVUSDT", "PENGUUSDT",
-    "LDOUSDT", "VIRTUALUSDT", "BRUSDT", "GALAUSDT", "CHIPUSDT", "MEGAUSDT", "TRUMPUSDT",
-    "POLUSDT", "FLOKIUSDT", "ONEUSDT", "JASMYUSDT", "1000BONKUSDT", "COAIUSDT", "APEUSDT",
-    "LSKUSDT", "VELVETUSDT", "ORDIUSDT", "WLFIUSDT", "ACEUSDT", "LYNUSDT", "COPPER(XCU)USDT",
-    "SPXUSDT", "KAITOUSDT", "MYXUSDT", "SYNUSDT", "ESPORTSUSDT", "BILLUSDT", "BLESSUSDT",
-    "UAIUSDT", "DEXEUSDT", "PIPPINUSDT", "CYSUSDT", "POWERUSDT", "TUTUSDT", "XAIUSDT",
-    "LIGHTUSDT", "GAS(NG)USDT", "ALLOUSDT", "HNTUSDT", "SKYAIUSDT", "PLATINUM(XPT)USDT", "EVAAUSDT",
-    "PALLADIUM(XPD)USDT", "BICOUSDT", "BTRUSDT", "HEIUSDT", "REUSDT", "FOLKSUSDT", "STOUSDT",
-    "NICKEL(XNI)USDT", "LAYERUSDT", "ALUMINIUM(XAL)USDT", "LEAD(XPB)USDT", "ZINC(XZN)USDT", "ACNUSDT", "AKAMUSDT",
-]
 
 active_symbols = {}
 current_hour_ts = 0
 hourly_candidates = {}
 trigger_confirm_counter = {}
 sent_signals = set()
+is_scanning = False
 
 
 # ==================== АВТО-СОХРАНЕНИЕ CHAT_ID ====================
 def get_target_chat_id() -> str:
-    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "ВАШ_CHAT_ID" and TELEGRAM_CHAT_ID.strip():
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in ("ВАШ_ТОКЕН_БОТА", "ВАШ_CHAT_ID") and TELEGRAM_CHAT_ID.strip():
         return TELEGRAM_CHAT_ID.strip()
     if os.path.exists(CHAT_ID_FILE):
         with open(CHAT_ID_FILE, "r", encoding="utf-8") as f:
@@ -69,7 +71,7 @@ def save_target_chat_id(chat_id):
 CSV_HEADERS = [
     "signal_id", "signal_time_utc", "ticker", "direction", "entry_price",
     "remaining_minutes", "streak_candles", "reversal_body_pct", "live_body_pct",
-    "trigger_reason", "status", "updated_time_utc"
+    "rsi_value", "trend_mode", "trigger_reason", "status", "updated_time_utc"
 ]
 
 
@@ -97,7 +99,11 @@ def update_signal_status(signal_id: str, new_status: str):
         reader = csv.DictReader(f)
         for row in reader:
             if "trigger_reason" not in row or not row["trigger_reason"]:
-                row["trigger_reason"] = "Смена цвета HA"
+                row["trigger_reason"] = "Глубокий откат"
+            if "rsi_value" not in row or not row["rsi_value"]:
+                row["rsi_value"] = "50.0"
+            if "trend_mode" not in row or not row["trend_mode"]:
+                row["trend_mode"] = "Н/Д"
             if row["signal_id"] == signal_id:
                 row["status"] = new_status
                 row["updated_time_utc"] = now_str
@@ -162,8 +168,60 @@ def get_stats_summary() -> str:
     return "\n".join(lines)
 
 
-# ==================== РАСЧЕТ HEIKIN ASHI ====================
+# ==================== РАСЧЕТ HEIKIN ASHI, RSI И EMA ====================
+def calculate_ema_series(closes: list, period: int = 50) -> list:
+    if not closes:
+        return []
+    ema = [closes[0]]
+    k = 2.0 / (period + 1.0)
+    for price in closes[1:]:
+        ema.append(price * k + ema[-1] * (1.0 - k))
+    return ema
+
+
+def calculate_rsi_series(closes: list, period: int = 14) -> list:
+    n = len(closes)
+    if n < period + 1:
+        return [50.0] * n
+
+    rsi = [50.0] * n
+    gains = []
+    losses = []
+
+    for i in range(1, period + 1):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if avg_loss == 0:
+        rsi[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period + 1, n):
+        diff = closes[i] - closes[i - 1]
+        gain = max(diff, 0.0)
+        loss = max(-diff, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi
+
+
 def calculate_heikin_ashi(ohlcv):
+    closes = [c[4] for c in ohlcv]
+    ema_series = calculate_ema_series(closes, EMA_PERIOD)
+    rsi_series = calculate_rsi_series(closes, RSI_PERIOD)
+
     ha_candles = []
     for i, candle in enumerate(ohlcv):
         ts, o, h, l, c, v = candle
@@ -197,7 +255,9 @@ def calculate_heikin_ashi(ohlcv):
             "real_low": l,
             "real_close": c,
             "body_pct": body_pct,
-            "color": color
+            "color": color,
+            "ema": ema_series[i],
+            "rsi": rsi_series[i]
         })
     return ha_candles
 
@@ -222,10 +282,12 @@ def build_signal_message(data: dict) -> str:
     streak = int(data["streak_candles"])
     rev_pct = float(data["reversal_body_pct"])
     live_pct = float(data["live_body_pct"])
+    rsi_val = float(data.get("rsi_value", 50.0))
+    trend_mode = data.get("trend_mode", "По тренду")
     trigger_reason = data.get("trigger_reason", "Глубокий откат")
     status = data["status"]
 
-    mexc_pair = ticker[:-4] + "_USDT"
+    mexc_pair = ticker[:-4] + "_USDT" if ticker.endswith("USDT") else ticker
     chart_url = f"https://futures.mexc.com/exchange/{mexc_pair}"
 
     if direction == "SHORT":
@@ -247,7 +309,9 @@ def build_signal_message(data: dict) -> str:
         "",
         f"📌 <b>Пара:</b> <code>{ticker}</code> (<a href='{chart_url}'>Открыть график</a>)",
         f"💰 <b>Цена входа:</b> <code>{price}</code>",
-        f"🎯 <b>Триггер входа:</b> {trigger_reason}",
+        f"🧭 <b>Режим фильтра:</b> {trend_mode}",
+        f"📈 <b>RSI ({RSI_PERIOD}):</b> {rsi_val:.1f}",
+        f"🎯 <b>Триггер:</b> {trigger_reason}",
         f"🕒 <b>Время (MEXC):</b> {dt_str} UTC",
         f"⏱ <b>До закрытия 1H свечи:</b> {rem_min:.1f} мин.",
         "",
@@ -398,16 +462,24 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                     elif text.startswith("/export"):
                         await send_telegram_file(session, chat_id)
                     elif text.startswith("/status") or text.startswith("/start"):
-                        cand_list = ", ".join(
-                            [f"{k} ({v['target_dir']})" for k, v in hourly_candidates.items()]
-                        ) or "нет кандидатов в этом часе"
+                        items = [
+                            f"{k} ({v['target_dir']}, RSI:{v['peak_rsi']:.0f})"
+                            for k, v in hourly_candidates.items()
+                        ]
+                        if len(items) > 40:
+                            cand_list = ", ".join(items[:40]) + f" ... и еще {len(items) - 40}"
+                        else:
+                            cand_list = ", ".join(items) or "нет кандидатов в этом часе"
+
+                        scan_state = "⏳ Идет сканирование рынка..." if is_scanning else "✅ Готово"
                         saved_cid = get_target_chat_id()
                         status_lines = [
-                            "🤖 <b>Бот Heikin Ashi + Deep Pullback активен</b>",
+                            "🤖 <b>Бот ВСЕ ФЬЮЧЕРСЫ MEXC (HA + Pullback + RSI/EMA)</b>",
                             f"📩 <b>Chat ID:</b> <code>{saved_cid}</code> (подключен ✅)",
-                            f"⚙️ <b>Мин. откат:</b> {MIN_PULLBACK_PCT}% (или {int(PULLBACK_RETRACE_RATIO*100)}% свечи)",
-                            f"📊 <b>Пар:</b> {len(active_symbols)} из {len(RAW_TICKERS)}",
-                            f"🎯 <b>Кандидаты ({len(hourly_candidates)}):</b>",
+                            f"📊 <b>Всего фьючерсов в работе:</b> {len(active_symbols)} пар (USDT-M)",
+                            f"🔄 <b>Статус сканера часа:</b> {scan_state}",
+                            f"⚙️ <b>Откат:</b> от {MIN_PULLBACK_PCT}% | <b>EMA:</b> {EMA_PERIOD} | <b>RSI:</b> {RSI_PERIOD}",
+                            f"🎯 <b>Кандидаты текущего часа ({len(hourly_candidates)}):</b>",
                             f"<code>{cand_list}</code>"
                         ]
                         await session.post(f"{base_url}/sendMessage", json={
@@ -423,30 +495,32 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
             await asyncio.sleep(5)
 
 
-# ==================== СКАНИРОВАНИЕ MEXC FUTURES ====================
-async def resolve_mexc_symbols(exchange):
-    markets = await exchange.load_markets()
+# ==================== АВТОЗАГРУЗКА ВСЕХ ФЬЮЧЕРСОВ MEXC ====================
+async def load_all_mexc_usdt_swaps(exchange):
+    """
+    Загружает абсолютно все активные бессрочные USDT-фьючерсы на бирже MEXC.
+    """
+    markets = await exchange.load_markets(True)
     resolved = {}
 
-    id_map = {}
     for sym, m in markets.items():
-        if m.get("swap") and m.get("quote") == "USDT":
+        if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True):
             raw_id = m.get("id", "").replace("_", "")
-            id_map[raw_id] = sym
+            if not raw_id:
+                raw_id = sym.split(":")[0].replace("/", "")
+            resolved[raw_id] = sym
 
-    for ticker in RAW_TICKERS:
-        if ticker in id_map:
-            resolved[ticker] = id_map[ticker]
-
-    print(f"[Инициализация] Найдено пар на MEXC Futures: {len(resolved)} из {len(RAW_TICKERS)}", flush=True)
+    print(f"[Инициализация] Загружено ВСЕХ активных USDT-фьючерсов MEXC: {len(resolved)}", flush=True)
     return resolved
 
 
 async def scan_hourly_candidates(exchange, hour_open_ts):
+    global is_scanning
+    is_scanning = True
     candidates = {}
     hour_ms = 3600 * 1000
     prev_closed_ts = hour_open_ts - hour_ms
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
     async def check_one(ticker, ccxt_sym):
         async with sem:
@@ -455,20 +529,18 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
             except Exception:
                 return
 
-            if not ohlcv or len(ohlcv) < 10:
+            if not ohlcv or len(ohlcv) < 55:
                 return
 
             closed_candles = [c for c in ohlcv if c[0] < hour_open_ts]
 
-            if len(closed_candles) < 10 or closed_candles[-1][0] != prev_closed_ts:
+            if len(closed_candles) < 55 or closed_candles[-1][0] != prev_closed_ts:
                 return
 
             ha_closed = calculate_heikin_ashi(closed_candles)
             reversal_candle = ha_closed[-1]
             idx_before_rev = len(ha_closed) - 2
 
-            # Берем максимум между телом разворотной свечи и средним размахом последних 5 свечей,
-            # чтобы маленькая разворотная свеча не давала слишком ранний вход
             recent_ranges = [abs(c["real_high"] - c["real_low"]) for c in ha_closed[-5:]]
             avg_recent_range = sum(recent_ranges) / len(recent_ranges)
             rev_real_range = max(
@@ -477,45 +549,60 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
                 avg_recent_range * 0.6
             )
 
+            recent_rsi_list = [c["rsi"] for c in ha_closed[-3:]]
+
             if reversal_candle["color"] == "RED":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "GREEN")
                 if streak >= 3:
-                    candidates[ticker] = {
-                        "target_dir": "SHORT",
-                        "target_live_color": "GREEN",
-                        "streak": streak,
-                        "rev_body_pct": reversal_candle["body_pct"],
-                        "rev_close_price": reversal_candle["real_close"],
-                        "rev_range": rev_real_range
-                    }
+                    max_rsi = max(recent_rsi_list)
+                    is_downtrend = reversal_candle["real_close"] < reversal_candle["ema"]
+                    if (is_downtrend and max_rsi >= RSI_SHORT_TREND - 3.0) or (max_rsi >= RSI_SHORT_OVERBOUGHT - 3.0):
+                        candidates[ticker] = {
+                            "target_dir": "SHORT",
+                            "target_live_color": "GREEN",
+                            "streak": streak,
+                            "rev_body_pct": reversal_candle["body_pct"],
+                            "rev_close_price": reversal_candle["real_close"],
+                            "rev_range": rev_real_range,
+                            "peak_rsi": max_rsi
+                        }
 
             elif reversal_candle["color"] == "GREEN":
                 streak = count_consecutive_color(ha_closed, idx_before_rev, "RED")
                 if streak >= 3:
-                    candidates[ticker] = {
-                        "target_dir": "LONG",
-                        "target_live_color": "RED",
-                        "streak": streak,
-                        "rev_body_pct": reversal_candle["body_pct"],
-                        "rev_close_price": reversal_candle["real_close"],
-                        "rev_range": rev_real_range
-                    }
+                    min_rsi = min(recent_rsi_list)
+                    is_uptrend = reversal_candle["real_close"] > reversal_candle["ema"]
+                    if (is_uptrend and min_rsi <= RSI_LONG_TREND + 3.0) or (min_rsi <= RSI_LONG_OVERSOLD + 3.0):
+                        candidates[ticker] = {
+                            "target_dir": "LONG",
+                            "target_live_color": "RED",
+                            "streak": streak,
+                            "rev_body_pct": reversal_candle["body_pct"],
+                            "rev_close_price": reversal_candle["real_close"],
+                            "rev_range": rev_real_range,
+                            "peak_rsi": min_rsi
+                        }
 
-    await asyncio.gather(*(check_one(t, s) for t, s in active_symbols.items()))
+    try:
+        await asyncio.gather(*(check_one(t, s) for t, s in active_symbols.items()))
+    finally:
+        is_scanning = False
+
     return candidates
 
 
-async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms, hour_open_ts, rem_min):
-    if (ticker, hour_open_ts) in sent_signals:
+async def monitor_candidate_live(exchange, session, sem, ticker, info, server_time_ms, hour_open_ts, rem_min):
+    if (ticker, hour_open_ts) in sent_signals or ticker not in active_symbols:
         return
 
     ccxt_sym = active_symbols[ticker]
-    try:
-        ohlcv = await exchange.fetch_ohlcv(ccxt_sym, timeframe=TIMEFRAME, limit=HISTORY_LIMIT)
-    except Exception:
-        return
+    async with sem:
+        try:
+            ohlcv = await exchange.fetch_ohlcv(ccxt_sym, timeframe=TIMEFRAME, limit=HISTORY_LIMIT)
+        except Exception:
+            return
 
-    if not ohlcv:
+    if not ohlcv or len(ohlcv) < 55:
         return
 
     ha_candles = calculate_heikin_ashi(ohlcv)
@@ -526,32 +613,52 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
 
     current_price = live_candle["real_close"]
     open_price = live_candle["real_open"]
+    ema_val = live_candle["ema"]
+    live_rsi = live_candle["rsi"]
     rev_range = info["rev_range"]
     target_dir = info["target_dir"]
 
     trigger_reason = None
+    trend_mode = None
+    effective_rsi = live_rsi
 
     if target_dir == "SHORT" and current_price > open_price:
         pullback_abs = current_price - open_price
         pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
         retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        # Обязательное условие: откат вверх минимум MIN_PULLBACK_PCT (0.85%) И (70% от размаха ИЛИ 1.40% чистого движения)
         if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
-            ha_tag = "Зеленая HA + " if live_candle["color"] == "GREEN" else ""
-            trigger_reason = f"{ha_tag}Глубокий откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
+            effective_rsi = max(live_rsi, info["peak_rsi"])
+            in_downtrend = current_price < ema_val
+
+            if in_downtrend and effective_rsi >= RSI_SHORT_TREND:
+                trend_mode = f"По тренду вниз (&lt; EMA{EMA_PERIOD}) + RSI {effective_rsi:.1f}"
+            elif effective_rsi >= RSI_SHORT_OVERBOUGHT:
+                trend_mode = f"Перекупленность (RSI {effective_rsi:.1f} &gt;= {RSI_SHORT_OVERBOUGHT:.0f})"
+
+            if trend_mode:
+                ha_tag = "Зеленая HA + " if live_candle["color"] == "GREEN" else ""
+                trigger_reason = f"{ha_tag}Откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
 
     elif target_dir == "LONG" and current_price < open_price:
         pullback_abs = open_price - current_price
         pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
         retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        # Обязательное условие: откат вниз минимум MIN_PULLBACK_PCT (0.85%) И (70% от размаха ИЛИ 1.40% чистого движения)
         if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
-            ha_tag = "Красная HA + " if live_candle["color"] == "RED" else ""
-            trigger_reason = f"{ha_tag}Глубокий откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
+            effective_rsi = min(live_rsi, info["peak_rsi"])
+            in_uptrend = current_price > ema_val
 
-    if trigger_reason:
+            if in_uptrend and effective_rsi <= RSI_LONG_TREND:
+                trend_mode = f"По тренду вверх (&gt; EMA{EMA_PERIOD}) + RSI {effective_rsi:.1f}"
+            elif effective_rsi <= RSI_LONG_OVERSOLD:
+                trend_mode = f"Перепроданность (RSI {effective_rsi:.1f} &lt;= {RSI_LONG_OVERSOLD:.0f})"
+
+            if trend_mode:
+                ha_tag = "Красная HA + " if live_candle["color"] == "RED" else ""
+                trigger_reason = f"{ha_tag}Откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
+
+    if trigger_reason and trend_mode:
         trigger_confirm_counter[ticker] = trigger_confirm_counter.get(ticker, 0) + 1
     else:
         trigger_confirm_counter[ticker] = 0
@@ -563,6 +670,7 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
         ).strftime("%Y-%m-%d %H:%M:%S")
 
         signal_id = f"{ticker}_{hour_open_ts // 1000}"
+        clean_trend_csv = trend_mode.replace("&lt;", "<").replace("&gt;", ">")
         signal_data = {
             "signal_id": signal_id,
             "signal_time_utc": dt_str,
@@ -573,6 +681,8 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
             "streak_candles": info["streak"],
             "reversal_body_pct": f"{info['rev_body_pct']:.4f}",
             "live_body_pct": f"{live_candle['body_pct']:.4f}",
+            "rsi_value": f"{effective_rsi:.1f}",
+            "trend_mode": clean_trend_csv,
             "trigger_reason": trigger_reason,
             "status": "ОЖИДАЕТ",
             "updated_time_utc": dt_str
@@ -582,7 +692,10 @@ async def monitor_candidate_live(exchange, session, ticker, info, server_time_ms
         if sent_ok:
             sent_signals.add((ticker, hour_open_ts))
             log_new_signal(signal_data)
-            print(f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {target_dir} | {trigger_reason} | Цена: {current_price}", flush=True)
+            print(
+                f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {target_dir} | {clean_trend_csv} | {trigger_reason} | Цена: {current_price}",
+                flush=True
+            )
 
 
 # ==================== ТОЧКА ВХОДА ====================
@@ -590,16 +703,19 @@ async def main():
     global active_symbols, current_hour_ts, hourly_candidates, trigger_confirm_counter
 
     init_csv()
+    # Отключаем встроенный тормоз enableRateLimit и управляем скоростью через Semaphore(15)
     exchange = ccxt.mexc({
-        "enableRateLimit": True,
+        "enableRateLimit": False,
         "options": {"defaultType": "swap"}
     })
 
+    live_sem = asyncio.Semaphore(LIVE_CONCURRENCY)
+
     async with aiohttp.ClientSession() as session:
-        active_symbols = await resolve_mexc_symbols(exchange)
+        active_symbols = await load_all_mexc_usdt_swaps(exchange)
         tg_task = asyncio.create_task(telegram_polling_worker(session))
 
-        print("Бот успешно запущен на хостинге и отслеживает рынок...", flush=True)
+        print("Бот успешно запущен и отслеживает ВСЕ фьючерсы MEXC...", flush=True)
         try:
             while True:
                 try:
@@ -612,14 +728,26 @@ async def main():
                     if hour_open_ts != current_hour_ts and remaining_minutes <= SCAN_MAX_REMAINING_MIN:
                         current_hour_ts = hour_open_ts
                         trigger_confirm_counter.clear()
-                        print(f"\n[Новый час] Сканирование всех {len(active_symbols)} пар...", flush=True)
+
+                        # Раз в час обновляем список фьючерсов на случай новых листингов
+                        try:
+                            active_symbols = await load_all_mexc_usdt_swaps(exchange)
+                        except Exception:
+                            pass
+
+                        print(f"\n[Новый час] Сканирование всех {len(active_symbols)} фьючерсов MEXC...", flush=True)
+                        t0 = datetime.datetime.now()
                         hourly_candidates = await scan_hourly_candidates(exchange, hour_open_ts)
-                        print(f"[Кандидаты часа] Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}", flush=True)
+                        elapsed = (datetime.datetime.now() - t0).total_seconds()
+                        print(
+                            f"[Кандидаты часа] Проверено за {elapsed:.1f} сек. Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}",
+                            flush=True
+                        )
 
                     if MIN_REMAINING_MINUTES <= remaining_minutes <= ENTRY_MAX_REMAINING_MIN and hourly_candidates:
                         tasks = [
                             monitor_candidate_live(
-                                exchange, session, ticker, info,
+                                exchange, session, live_sem, ticker, info,
                                 server_time_ms, hour_open_ts, remaining_minutes
                             )
                             for ticker, info in hourly_candidates.items()
