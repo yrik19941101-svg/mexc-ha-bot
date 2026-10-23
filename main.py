@@ -1,16 +1,16 @@
 import asyncio
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА ====================
-DAYS_TO_BACKTEST = 45           # Глубина истории (45 дней)
+# ==================== НАСТРОЙКИ СТРАТЕГИИ ====================
+TIMEFRAME = "1h"
+DAYS_TO_BACKTEST = 60           # Глубина истории (60 дней)
 FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1)
-SL_PERCENT_OF_MARGIN = 0.90     # Стоп-лосс: -90%
-TP_PERCENT_OF_MARGIN = 1.50     # Тейк-профит: +150%
+SL_PERCENT_OF_MARGIN = 0.90     # Стоп-лосс: -90% от маржи
+TP_PERCENT_OF_MARGIN = 1.50     # Тейк-профит: +150% от маржи
 ASSUMED_LEVERAGE = 20           # Плечо
 
-# Фильтры тренда и флета
-MIN_BODY_PCT = 0.003            # Минимальный размер тела свечи (фильтр флета/доджи)
-EMA_PERIOD = 50                 # Период EMA для фильтрации тренда на 4H
+EMA_PERIOD = 50                 # Трендовый фильтр
+MIN_BODY_PCT = 0.002            # Минимальный размер тела свечи (защита от флета)
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -43,36 +43,17 @@ def calculate_ema(closes, period):
     multiplier = 2 / (period + 1)
     for price in closes[period:]:
         ema.append((price - ema[-1]) * multiplier + ema[-1])
-    # Дополняем начало до длины closes
     return [ema[0]] * (period - 1) + ema
 
 
-def aggregate_candles(candles_30m, target_minutes):
-    """Агрегация 30м свечей в старший таймфрейм (например, 4H = 8 свечей по 30м)"""
-    factor = target_minutes // 30
-    buckets = {}
-    for c in candles_30m:
-        ts, o, h, l, cl, v = c
-        target_ts = (ts // (target_minutes * 60 * 1000)) * (target_minutes * 60 * 1000)
-        if target_ts not in buckets:
-            buckets[target_ts] = [target_ts, o, h, l, cl, v]
-        else:
-            b = buckets[target_ts]
-            if h > b[2]: b[2] = h
-            if l < b[3]: b[3] = l
-            b[4] = cl
-            b[5] += v
-    return [buckets[k] for k in sorted(buckets.keys())]
-
-
 async def run_backtest():
-    print("🚀 Запуск бэктеста двухуровневой стратегии (4H -> 30m) с фильтрами тренда и флета...", flush=True)
+    print("🚀 Запуск оптимизированного бэктеста (1H + Откат + EMA 50 + Фильтр флета)...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
     active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)]
 
-    print(f"📊 Найдено пар на BingX: {len(active_swaps)}. Скачиваем 30m историю за {DAYS_TO_BACKTEST} дней...", flush=True)
+    print(f"📊 Найдено пар на BingX: {len(active_swaps)}. Скачиваем историю за {DAYS_TO_BACKTEST} дней...", flush=True)
     since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
 
     total_signals = 0
@@ -80,82 +61,44 @@ async def run_backtest():
     losses = 0
     total_pnl_usd = 0.0
 
-    for i, sym in enumerate(active_swaps[:50]): # Ограничим для теста первыми 50 парами для скорости
+    for sym in active_swaps:
         try:
-            ohlcv_30m = await exchange.fetch_ohlcv(sym, timeframe="30m", since=since_timestamp, limit=1500)
-            if not ohlcv_30m or len(ohlcv_30m) < 200: 
+            ohlcv_1h = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_timestamp, limit=1500)
+            if not ohlcv_1h or len(ohlcv_1h) < 100: 
                 continue
 
-            ohlcv_4h = aggregate_candles(ohlcv_30m, 240)
-            if len(ohlcv_4h) < EMA_PERIOD + 10: 
-                continue
+            ha_candles = calculate_heikin_ashi(ohlcv_1h)
+            closes = [c["real_close"] for c in ha_candles]
+            ema_values = calculate_ema(closes, EMA_PERIOD)
 
-            ha_4h_all = calculate_heikin_ashi(ohlcv_4h)
-            closes_4h = [c["real_close"] for c in ha_4h_all]
-            ema_4h = calculate_ema(closes_4h, EMA_PERIOD)
-
-            # Идем по 30м свечам и сопоставляем с 4H контекстом
-            for idx_30m in range(50, len(ohlcv_30m) - 48):
-                c_30m = ohlcv_30m[idx_30m]
-                t_30m = c_30m[0]
-
-                # Находим соответствующий 4H бар
-                current_4h_ts = (t_30m // (240 * 60 * 1000)) * (240 * 60 * 1000)
-                h4_idx = -1
-                for j, h4_c in enumerate(ohlcv_4h):
-                    if h4_c[0] == current_4h_ts:
-                        h4_idx = j
-                        break
+            for idx in range(EMA_PERIOD, len(ha_candles) - 24):
+                prev_c = ha_candles[idx - 1]
+                curr_c = ha_candles[idx]
                 
-                if h4_idx < 5 or h4_idx >= len(ha_4h_all) - 1:
-                    continue
-
-                # Проверяем состояние 4H (предыдущая закрытая + текущая сменила цвет)
-                prev_4h = ha_4h_all[h4_idx - 1]
-                curr_4h = ha_4h_all[h4_idx]
-                
-                # Фильтр флета по размеру тела на 4H
-                if curr_4h["body_pct"] < MIN_BODY_PCT:
-                    continue
-
-                h4_trend = None
-                # Если предыдущая красная, текущая стала зеленой -> 4H бычий контекст (LONG)
-                if prev_4h["color"] == "RED" and curr_4h["color"] == "GREEN":
-                    if curr_4h["real_close"] > ema_4h[h4_idx]: # Фильтр тренда по EMA
-                        h4_trend = "LONG"
-                # Если предыдущая зеленая, текущая стала красной -> 4H медвежий контекст (SHORT)
-                elif prev_4h["color"] == "GREEN" and curr_4h["color"] == "RED":
-                    if curr_4h["real_close"] < ema_4h[h4_idx]: # Фильтр тренда по EMA
-                        h4_trend = "SHORT"
-
-                if not h4_trend:
-                    continue
-
-                # Теперь проверяем 30m триггер в рамках этого 4H контекста
-                ha_30m_slice = calculate_heikin_ashi(ohlcv_30m[:idx_30m + 1])
-                if len(ha_30m_slice) < 3:
-                    continue
-
-                prev_30 = ha_30m_slice[-2]
-                curr_30 = ha_30m_slice[-1]
-
-                # Фильтр флета по размеру тела на 30m
-                if curr_30["body_pct"] < MIN_BODY_PCT:
+                # Фильтр флета по размеру тела
+                if curr_c["body_pct"] < MIN_BODY_PCT:
                     continue
 
                 target_dir = None
-                # Если 4H LONG и на 30m произошло подтверждение (предыдущая красная, текущая стала зеленой)
-                if h4_trend == "LONG" and prev_30["color"] == "RED" and curr_30["color"] == "GREEN":
-                    target_dir = "LONG"
-                # Если 4H SHORT и на 30m произошло подтверждение (предыдущая зеленая, текущая стала красной)
-                elif h4_trend == "SHORT" and prev_30["color"] == "GREEN" and curr_30["color"] == "RED":
-                    target_dir = "SHORT"
+                current_price = curr_c["real_close"]
+                ema_val = ema_values[idx]
+
+                # ЛОГИКА ОТКАТА С ТРЕНДОВЫМ ФИЛЬТРОМ:
+                # 1. Если предыдущая RED, а текущая стала GREEN -> Ждем отката вверх, входим в SHORT (если ниже EMA)
+                if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
+                    if current_price < ema_val:
+                        target_dir = "SHORT"
+
+                # 2. Если предыдущая GREEN, а текущая стала RED -> Ждем отката вниз, входим в LONG (если выше EMA)
+                elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED":
+                    if current_price > ema_val:
+                        target_dir = "LONG"
 
                 if not target_dir:
                     continue
 
                 total_signals += 1
-                entry_p = curr_30["real_close"]
+                entry_p = current_price
                 
                 pos_size = FIXED_TRADE_AMOUNT * ASSUMED_LEVERAGE
                 sl_delta = (FIXED_TRADE_AMOUNT * SL_PERCENT_OF_MARGIN / pos_size) * entry_p
@@ -168,11 +111,11 @@ async def run_backtest():
                     sl_price = entry_p + sl_delta
                     tp_price = entry_p - tp_delta
 
-                # Проверка отработки сделки по будущим 30м свечам (проверяем в течение 24 часов / 48 баров)
+                # Проверка отработки в течение следующих 24 свечей
                 trade_result = None
-                for future_c in ohlcv_30m[idx_30m + 1 : idx_30m + 48]:
-                    f_high = future_c[2]
-                    f_low = future_c[3]
+                for future_c in ha_candles[idx + 1 : idx + 25]:
+                    f_high = future_c["real_high"]
+                    f_low = future_c["real_low"]
 
                     if target_dir == "LONG":
                         hit_tp = f_high >= tp_price
@@ -212,8 +155,8 @@ async def run_backtest():
     await exchange.close()
 
     print("\n" + "="*50, flush=True)
-    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА (4H -> 30m + Тренд EMA + Фильтр флета):", flush=True)
-    print(f"Всего отфильтрованных сигналов: {total_signals}", flush=True)
+    print("📈 РЕЗУЛЬТАТЫ ОПТИМИЗИРОВАННОГО БЭКТЕСТА:", flush=True)
+    print(f"Всего сделок: {total_signals}", flush=True)
     print(f"✅ Успешных (TP +150%): {wins}", flush=True)
     print(f"❌ Убыточных (SL -90%): {losses}", flush=True)
     marked = wins + losses
