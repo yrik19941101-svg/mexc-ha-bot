@@ -1,14 +1,13 @@
 import asyncio
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА ====================
+# ==================== НАСТРОЙКИ БЭКТЕСТА (TP 150%) ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 60           # Глубина истории (60 дней)
-FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1), без умножения
+FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1)
 SL_PERCENT_OF_MARGIN = 0.90     # Стоп-лосс: -90% от маржи
-TP_PERCENT_OF_MARGIN = 2.00     # Тейк-профит: +200% от маржи
+TP_PERCENT_OF_MARGIN = 1.50     # Тейк-профит: +150% от маржи
 ASSUMED_LEVERAGE = 20           # Плечо для расчета ценового расстояния
-MIN_REMAINING_MINUTES = 30.0    # До закрытия свечи должно оставаться не менее 30 мин
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -35,7 +34,7 @@ def calculate_heikin_ashi(ohlcv):
 
 
 async def run_backtest():
-    print("🚀 Запуск бэктеста по всем фьючерсным парам BingX (TP 200%, без догона)...", flush=True)
+    print("🚀 Запуск бэктеста по всем фьючерсным парам BingX (TP 150%)...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
@@ -64,11 +63,12 @@ async def run_backtest():
 
                 c_open, c_high, c_low, c_close = curr_candle[1], curr_candle[2], curr_candle[3], curr_candle[4]
                 
+                # Инвертированный вход (согласно предыдущему шагу)
                 target_dir = None
                 if prev_color == "RED" and c_close > c_open:
-                    target_dir = "LONG"
-                elif prev_color == "GREEN" and c_close < c_open:
                     target_dir = "SHORT"
+                elif prev_color == "GREEN" and c_close < c_open:
+                    target_dir = "LONG"
 
                 if not target_dir: 
                     continue
@@ -130,9 +130,9 @@ async def run_backtest():
     await exchange.close()
 
     print("\n" + "="*45, flush=True)
-    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА (TP 200%, Фикс. маржа):", flush=True)
+    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА (TP 150%):", flush=True)
     print(f"Всего сделок: {total_signals}", flush=True)
-    print(f"✅ Успешных (TP +200%): {wins}", flush=True)
+    print(f"✅ Успешных (TP +150%): {wins}", flush=True)
     print(f"❌ Убыточных (SL -90%): {losses}", flush=True)
     marked = wins + losses
     winrate = (wins / marked * 100.0) if marked > 0 else 0.0
