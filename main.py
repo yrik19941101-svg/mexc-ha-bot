@@ -2,28 +2,30 @@ import asyncio
 import datetime
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА ====================
+# ==================== НАСТРОЙКИ УЖЕСТОЧЕННОГО БЭКТЕСТА ====================
 TIMEFRAME = "1h"
-DAYS_TO_BACKTEST = 60           # Глубина истории для теста (60 дней)
+DAYS_TO_BACKTEST = 60           
 MIN_24H_VOLUME_USDT = 1_500_000
 
-# Параметры риск-менеджмента для теста
+# Параметры риск-менеджмента
 SL_PERCENT_OF_MARGIN = 0.90     # -90% от маржи
 TP_PERCENT_OF_MARGIN = 1.10     # +110% от маржи
-ASSUMED_LEVERAGE = 20           # Плечо для расчета ценового расстояния до SL/TP
+ASSUMED_LEVERAGE = 20           
 
-# Фильтры стратегии (как в боте)
+# Жесткие фильтры для повышения винрейта
 MIN_BODY_PCT = 0.005
-REV_MIN_STRENGTH_RATIO = 0.35
-REV_MIN_ABS_BODY_PCT = 0.08
-PULLBACK_RETRACE_RATIO = 0.45
-MIN_PULLBACK_PCT = 0.50
-DIRECT_PULLBACK_PCT = 0.85
-MIN_BOUNCE_PCT = 0.18
-MIN_BOUNCE_RATIO = 0.22
+REV_MIN_STRENGTH_RATIO = 0.40   # Увеличена требуемая сила разворотной свечи (40%)
+REV_MIN_ABS_BODY_PCT = 0.10     
+
+PULLBACK_RETRACE_RATIO = 0.50   
+MIN_PULLBACK_PCT = 0.80         # Увеличен минимальный откат до 0.80%
+DIRECT_PULLBACK_PCT = 1.20      
+MIN_BOUNCE_PCT = 0.25           # Увеличен минимальный отскок до 0.25%
+MIN_BOUNCE_RATIO = 0.25         
+
 RSI_PERIOD = 14
-RSI_SHORT_OVERBOUGHT = 68.0
-RSI_LONG_OVERSOLD = 32.0
+RSI_SHORT_OVERBOUGHT = 70.0     # Более строгая перекупленность
+RSI_LONG_OVERSOLD = 30.0        # Более строгая перепроданность
 
 
 def calculate_rsi_series(closes: list, period: int = 14) -> list:
@@ -98,39 +100,55 @@ def get_htf_color(ha_candles: list) -> str:
     if not ha_candles: return "DOJI"
     last_c = ha_candles[-1]
     if last_c["color"] != "DOJI" and last_c["body_pct"] >= 0.03: return last_c["color"]
-    if len(ha_candles) >= 2: return last_c["header"] if "header" in last_c else last_c["color"]
+    if len(ha_candles) >= 2: return ha_candles[-2]["color"]
     return last_c["color"]
 
 
 async def run_backtest():
-    print("🚀 Инициализация бэктеста на истории BingX...", flush=True)
+    print("🚀 Запуск улучшенного бэктеста с фильтром BTC и строгим откатом...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
     active_swaps = []
+    btc_symbol = None
+    
     for sym, m in markets.items():
         if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True):
             active_swaps.append(sym)
+            if "BTC" in sym and btc_symbol is None:
+                btc_symbol = sym
 
-    print(f"📊 Найдено активных пар на BingX: {len(active_swaps)}. Начинаем скачивание истории за {DAYS_TO_BACKTEST} дней...", flush=True)
+    if not btc_symbol:
+        btc_symbol = "BTC/USDT:USDT"
+
+    since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
+
+    print(f"📊 Загружаем историю BTC для фильтра тренда...", flush=True)
+    try:
+        btc_ohlcv = await exchange.fetch_ohlcv(btc_symbol, timeframe="1h", since=since_timestamp, limit=1500)
+        btc_ha = calculate_heikin_ashi(btc_ohlcv)
+        btc_colors = {c["timestamp"]: c["color"] for c in btc_ha}
+    except Exception as e:
+        print(f"Не удалось загрузить историю BTC: {e}", flush=True)
+        btc_colors = {}
 
     total_signals = 0
     wins = 0
     losses = 0
 
-    since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
-
     for i, sym in enumerate(active_swaps[:30]):
+        if sym == btc_symbol: continue
         try:
             ohlcv_1h = await exchange.fetch_ohlcv(sym, timeframe="1h", since=since_timestamp, limit=1500)
             if not ohlcv_1h or len(ohlcv_1h) < 100:
                 continue
 
-            print(f"[{i+1}/{min(30, len(active_swaps))}] Анализ пары {sym} (свечей: {len(ohlcv_1h)})", flush=True)
+            print(f"[{i+1}/30] Проверка пары {sym}...", flush=True)
 
             for idx in range(60, len(ohlcv_1h) - 25):
                 historical_slice = ohlcv_1h[:idx]
                 current_candle = ohlcv_1h[idx]
+                c_ts = current_candle[0]
                 
                 closed_1h = historical_slice[:-1]
                 ha_1h = calculate_heikin_ashi(closed_1h)
@@ -147,6 +165,12 @@ async def run_backtest():
                     if streak_1h >= 3: target_dir = "LONG"
 
                 if not target_dir: continue
+
+                # Фильтр BTC тренда
+                if c_ts in btc_colors:
+                    btc_col = btc_colors[c_ts]
+                    if target_dir == "SHORT" and btc_col != "RED": continue
+                    if target_dir == "LONG" and btc_col != "GREEN": continue
 
                 streak_slice = ha_1h[idx_before_rev - streak_1h + 1 : idx_before_rev + 1]
                 avg_streak_body = sum(c["body_pct"] for c in streak_slice) / len(streak_slice)
@@ -236,13 +260,13 @@ async def run_backtest():
     await exchange.close()
 
     print("\n" + "="*40, flush=True)
-    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА СТРАТЕГИИ:", flush=True)
+    print("📈 РЕЗУЛЬТАТЫ УЛУЧШЕННОГО БЭКТЕСТА:", flush=True)
     print(f"Всего найдено сделок: {total_signals}", flush=True)
     print(f"✅ Успешных (TP +110%): {wins}", flush=True)
     print(f"❌ Убыточных (SL -90%): {losses}", flush=True)
     marked = wins + losses
     winrate = (wins / marked * 100.0) if marked > 0 else 0.0
-    print(f"🎯 Итоговый Винрейт: {winrate:.1f}%", flush=True)
+    print(f"🎯 Новый Винрейт: {winrate:.1f}%", flush=True)
     print("="*40, flush=True)
 
 if __name__ == "__main__":
