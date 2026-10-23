@@ -2,17 +2,18 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== СЕТКА ПАРАМЕТРОВ ДЛЯ ПОИСКА ====================
+# ==================== РАСШИРЕННАЯ СЕТКА ПАРАМЕТРОВ ====================
 TIMEFRAME = "1h"
-DAYS_TO_BACKTEST = 45           # Глубина истории для анализа
-FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1)
-ASSUMED_LEVERAGE = 20           # Плечо
+DAYS_TO_BACKTEST = 45
+FIXED_TRADE_AMOUNT = 1.0
+ASSUMED_LEVERAGE = 20
 
-# Что именно будет перебирать оптимизатор:
-TP_GRID = [1.0, 1.5, 2.0]       # Тейк-профит (% от маржи)
-SL_GRID = [0.7, 0.9, 1.1]       # Стоп-лосс (% от маржи)
-EMA_GRID = [20, 50, 100]        # Периоды EMA для тренда
-BODY_GRID = [0.001, 0.003]      # Минимальный размер тела свечи (фильтр флета)
+# Новые сетки для перебора
+TP_GRID = [1.0, 1.5]
+SL_GRID = [0.9, 1.1]
+EMA_GRID = [20, 50]
+RSI_FILTER_ENABLED = [True, False]  # Проверим с RSI и без
+VOLUME_MULT_GRID = [1.0, 1.3]       # Множитель объема (1.0 = равен среднему, 1.3 = выше на 30%)
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -33,7 +34,7 @@ def calculate_heikin_ashi(ohlcv):
         ha_candles.append({
             "timestamp": ts, "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low,
             "ha_close": ha_close, "real_open": o, "real_high": h, "real_low": l,
-            "real_close": c, "body_pct": body_pct, "color": color
+            "real_close": c, "body_pct": body_pct, "color": color, "volume": v
         })
     return ha_candles
 
@@ -48,47 +49,72 @@ def calculate_ema(closes, period):
     return [ema[0]] * (period - 1) + ema
 
 
-async def run_optimizer():
-    print("🚀 Запуск оптимизатора стратегии на истории BingX...", flush=True)
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return [50.0] * len(closes)
+    
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    rsi = [50.0] * period
+    for i in range(period, len(deltas)):
+        gain = gains[i]
+        loss = losses[i]
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        
+        if avg_loss == 0:
+            rsi.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi.append(100.0 - (100.0 / (1.0 + rs)))
+            
+    return [50.0] + rsi # Дополняем до длины closes
+
+
+async def run_advanced_optimizer():
+    print("🚀 Запуск расширенного оптимизатора (RSI + Объемы + EMA)...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
-    active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)]
+    active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote"] == "USDT" and m.get("active", True)]
+    active_swaps = active_swaps[:35] # Топ-35 пар для скорости
 
-    # Возьмем топ-40 пар для быстрого и качественного теста
-    active_swaps = active_swaps[:40]
-
-    print(f"📊 Скачиваем историю для {len(active_swaps)} пар за {DAYS_TO_BACKTEST} дней...", flush=True)
+    print(f"📊 Скачиваем историю для {len(active_swaps)} пар...", flush=True)
     since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
 
     cached_market_data = {}
     for sym in active_swaps:
         try:
             ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_timestamp, limit=1200)
-            # ИСПРАВЛЕНА ОШИБКА СКОБОК ЗДЕСЬ:
             if ohlcv and len(ohlcv) > 100:
                 ha_candles = calculate_heikin_ashi(ohlcv)
                 closes = [c["real_close"] for c in ha_candles]
+                volumes = [c["volume"] for c in ha_candles]
+                rsi_values = calculate_rsi(closes, 14)
+                
                 cached_market_data[sym] = {
                     "ha_candles": ha_candles,
-                    "closes": closes
+                    "closes": closes,
+                    "volumes": volumes,
+                    "rsi": rsi_values
                 }
-        except Exception as e:
-            print(f"⚠️ Ошибка загрузки {sym}: {e}", flush=True)
+        except Exception:
+            pass
 
     await exchange.close()
-    print(f"💾 Успешно загружено и закешировано пар: {len(cached_market_data)}. Начинаем перебор комбинаций...", flush=True)
+    print(f"💾 Закешировано пар: {len(cached_market_data)}. Перебираем комбинации...", flush=True)
 
-    if len(cached_market_data) == 0:
-        print("❌ Не удалось загрузить ни одной пары. Проверьте интернет-соединение.", flush=True)
-        return
-
-    combinations = list(product(TP_GRID, SL_GRID, EMA_GRID, BODY_GRID))
-    print(f"🔬 Всего комбинаций для проверки: {len(combinations)}\n", flush=True)
+    combinations = list(product(TP_GRID, SL_GRID, EMA_GRID, RSI_FILTER_ENABLED, VOLUME_MULT_GRID))
+    print(f"🔬 Всего комбинаций: {len(combinations)}\n", flush=True)
 
     best_results = []
 
-    for tp_pct, sl_pct, ema_p, min_body in combinations:
+    for tp_pct, sl_pct, ema_p, use_rsi, vol_mult in combinations:
         total_signals = 0
         wins = 0
         losses = 0
@@ -97,25 +123,33 @@ async def run_optimizer():
         for sym, data in cached_market_data.items():
             ha_candles = data["ha_candles"]
             closes = data["closes"]
+            volumes = data["volumes"]
+            rsi_vals = data["rsi"]
             ema_values = calculate_ema(closes, ema_p)
 
-            for idx in range(ema_p, len(ha_candles) - 24):
+            for idx in range(max(ema_p, 20), len(ha_candles) - 24):
                 prev_c = ha_candles[idx - 1]
                 curr_c = ha_candles[idx]
                 
-                if curr_c["body_pct"] < min_body:
+                # Фильтр объема: текущий объем должен быть выше среднего за 20 баров * vol_mult
+                avg_vol = sum(volumes[idx-20:idx]) / 20 if idx >= 20 else volumes[idx]
+                if curr_c["volume"] < avg_vol * vol_mult:
                     continue
 
                 target_dir = None
                 current_price = curr_c["real_close"]
                 ema_val = ema_values[idx]
+                rsi_val = rsi_vals[idx]
 
+                # Логика отката
                 if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
                     if current_price < ema_val:
-                        target_dir = "SHORT"
+                        if not use_rsi or (35 < rsi_val < 70): # RSI фильтр для шорта/лонга
+                            target_dir = "SHORT"
                 elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED":
                     if current_price > ema_val:
-                        target_dir = "LONG"
+                        if not use_rsi or (30 < rsi_val < 65):
+                            target_dir = "LONG"
 
                 if not target_dir:
                     continue
@@ -174,20 +208,20 @@ async def run_optimizer():
         marked = wins + losses
         winrate = (wins / marked * 100.0) if marked > 0 else 0.0
 
-        if marked > 15:
+        if marked > 10:
             best_results.append({
-                "tp": tp_pct, "sl": sl_pct, "ema": ema_p, "body": min_body,
+                "tp": tp_pct, "sl": sl_pct, "ema": ema_p, "rsi": use_rsi, "vol": vol_mult,
                 "signals": marked, "winrate": winrate, "pnl": total_pnl
             })
 
-    best_results.sort(key=lambda x: x["pnl"], reverse=True)
+    best_results.sort(key=lambda x: x["winrate"], reverse=True) # Сортируем именно по винрейту!
 
-    print("\n" + "="*60, flush=True)
-    print("🏆 ТОП-5 ЛУЧШИХ КОНФИГУРАЦИЙ СТРАТЕГИИ:", flush=True)
-    print("="*60, flush=True)
+    print("\n" + "="*70, flush=True)
+    print("🏆 ТОП-5 КОНФИГУРАЦИЙ ПО ВИНРЕЙТУ:", flush=True)
+    print("="*70, flush=True)
     for i, res in enumerate(best_results[:5], 1):
-        print(f"#{i} | TP: +{res['tp']*100:.0f}% | SL: -{res['sl']*100:.0f}% | EMA: {res['ema']} | Фильтр тела: {res['body']} | Сделок: {res['signals']} | Винрейт: {res['winrate']:.1f}% | PnL: ${res['pnl']:.2f}", flush=True)
-    print("="*60, flush=True)
+        print(f"#{i} | Винрейт: {res['winrate']:.1f}% | TP: +{res['tp']*100:.0f}% | SL: -{res['sl']*100:.0f}% | EMA: {res['ema']} | RSI: {res['rsi']} | Объем x{res['vol']} | Сделок: {res['signals']} | PnL: ${res['pnl']:.2f}", flush=True)
+    print("="*70, flush=True)
 
 if __name__ == "__main__":
-    asyncio.run(run_optimizer())
+    asyncio.run(run_advanced_optimizer())
