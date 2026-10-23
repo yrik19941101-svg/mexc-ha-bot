@@ -5,39 +5,40 @@ import os
 import aiohttp
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ ====================
+# ==================== ОСНОВНЫЕ НАСТРОЙКИ ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 TIMEFRAME = "1h"
-HISTORY_LIMIT = 120             # Достаточно для точного EMA(50), RSI(14) и Heikin Ashi
-LIVE_POLL_INTERVAL = 4          # Опрос кандидатов каждые 4 сек
-MIN_REMAINING_MINUTES = 30.0    # Вход разрешен только если до конца часа >= 30 мин
+HISTORY_LIMIT = 120
+LIVE_POLL_INTERVAL = 3
+MIN_REMAINING_MINUTES = 25.0    # Вход разрешен в первые 35 минут часа (остаток >= 25 мин)
 SCAN_MAX_REMAINING_MIN = 59.75  # Сканируем рынок через 15 секунд после начала часа
-ENTRY_MAX_REMAINING_MIN = 57.5  # Ждем первые 2.5 минуты часа для формирования глубокого отката
+ENTRY_MAX_REMAINING_MIN = 59.0  # Мониторинг точки входа через 1 минуту после начала часа
 MIN_BODY_PCT = 0.005
-CONFIRM_CHECKS = 3              # Удержание уровня отката минимум 3 проверки подряд
+CONFIRM_CHECKS = 2              # Подтверждение отбоя 2 проверки подряд (~6 сек)
 
-# Параллельность запросов к MEXC (15 одновременных запросов позволяют проверить ~600 пар за ~25 сек)
-SCAN_CONCURRENCY = 15
-LIVE_CONCURRENCY = 10
+# Ликвидность и скорость сканирования BingX
+MIN_24H_VOLUME_USDT = 1_500_000 # Берем только ликвидные пары с оборотом >= 1.5 млн USDT за 24ч
+SCAN_CONCURRENCY = 10
+LIVE_CONCURRENCY = 8
 
-# --- НАСТРОЙКИ ГЛУБОКОГО ОТКАТА ОТ ОТКРЫТИЯ ЧАСА ---
-PULLBACK_RETRACE_RATIO = 0.70   # Откат минимум 70% от размаха предыдущей свечи (или среднего размаха)
-MIN_PULLBACK_PCT = 0.85         # Обязательный минимальный откат от открытия часа не менее 0.85%
-DIRECT_PULLBACK_PCT = 1.40      # Безусловный глубокий откат от открытия часа (1.40%+)
+# --- ЭТАП 3: СИЛА РАЗВОРОТНОЙ СВЕЧИ НА 1H ---
+REV_MIN_STRENGTH_RATIO = 0.35   # Тело разворотной свечи >= 35% от среднего тела серии
+REV_MIN_ABS_BODY_PCT = 0.08     # Минимальное тело разворотной свечи HA (0.08%)
 
-# --- НАСТРОЙКИ ФИЛЬТРА ТРЕНДА (EMA) И ПЕРЕКУПЛЕННОСТИ (RSI) ---
-EMA_PERIOD = 50
+# --- ЭТАП 4: ДВУХФАЗНЫЙ ВХОД (ФАЗА 1: ОТКАТ -> ФАЗА 2: ОТБОЙ ОТ ПИКА) ---
+PULLBACK_RETRACE_RATIO = 0.45   # Фаза 1: откат >= 45% от размаха предыдущей свечи
+MIN_PULLBACK_PCT = 0.50         # Фаза 1: минимальный откат от цены открытия часа (0.50%)
+DIRECT_PULLBACK_PCT = 0.85      # Фаза 1: безусловный глубокий откат от открытия часа (0.85%)
+
+MIN_BOUNCE_PCT = 0.18           # Фаза 2: минимальный отскок цены от пика отката в нашу сторону (0.18%)
+MIN_BOUNCE_RATIO = 0.22         # Фаза 2: цена должна отбить минимум 22% от длины волны отката
+
+# --- НАСТРОЙКИ RSI (ДЛЯ РАЗВОРОТОВ НА ЭКСТРЕМУМАХ) ---
 RSI_PERIOD = 14
-
-# Пороги для SHORT:
-RSI_SHORT_TREND = 55.0          # Если идем ПО ТРЕНДУ вниз (цена ниже EMA 50), достаточно RSI >= 55
-RSI_SHORT_OVERBOUGHT = 68.0     # Если идем ПРОТИВ тренда, нужна сильная перекупленность RSI >= 68
-
-# Пороги для LONG:
-RSI_LONG_TREND = 45.0           # Если идем ПО ТРЕНДУ вверх (цена выше EMA 50), достаточно RSI <= 45
-RSI_LONG_OVERSOLD = 32.0        # Если идем ПРОТИВ тренда, нужна сильная перепроданность RSI <= 32
+RSI_SHORT_OVERBOUGHT = 68.0     # Перекупленность для SHORT, если 1D еще зеленый
+RSI_LONG_OVERSOLD = 32.0        # Перепроданность для LONG, если 1D еще красный
 
 LOG_FILE = "signals_log.csv"
 CHAT_ID_FILE = "chat_id.txt"
@@ -71,7 +72,7 @@ def save_target_chat_id(chat_id):
 CSV_HEADERS = [
     "signal_id", "signal_time_utc", "ticker", "direction", "entry_price",
     "remaining_minutes", "streak_candles", "reversal_body_pct", "live_body_pct",
-    "rsi_value", "trend_mode", "trigger_reason", "status", "updated_time_utc"
+    "rsi_value", "mtf_mode", "trigger_reason", "status", "updated_time_utc"
 ]
 
 
@@ -99,11 +100,11 @@ def update_signal_status(signal_id: str, new_status: str):
         reader = csv.DictReader(f)
         for row in reader:
             if "trigger_reason" not in row or not row["trigger_reason"]:
-                row["trigger_reason"] = "Глубокий откат"
+                row["trigger_reason"] = "Откат + Отбой"
             if "rsi_value" not in row or not row["rsi_value"]:
                 row["rsi_value"] = "50.0"
-            if "trend_mode" not in row or not row["trend_mode"]:
-                row["trend_mode"] = "Н/Д"
+            if "mtf_mode" not in row or not row["mtf_mode"]:
+                row["mtf_mode"] = "1D + 6H + 1H"
             if row["signal_id"] == signal_id:
                 row["status"] = new_status
                 row["updated_time_utc"] = now_str
@@ -152,7 +153,7 @@ def get_stats_summary() -> str:
     marked = win + loss
     winrate = (win / marked * 100.0) if marked > 0 else 0.0
     lines = [
-        "📊 <b>Статистика сигналов:</b>",
+        "📊 <b>Статистика сигналов (BingX Futures):</b>",
         "",
         f"Всего сигналов: <b>{total}</b>",
         f"✅ Зашло: <b>{win}</b>",
@@ -168,17 +169,7 @@ def get_stats_summary() -> str:
     return "\n".join(lines)
 
 
-# ==================== РАСЧЕТ HEIKIN ASHI, RSI И EMA ====================
-def calculate_ema_series(closes: list, period: int = 50) -> list:
-    if not closes:
-        return []
-    ema = [closes[0]]
-    k = 2.0 / (period + 1.0)
-    for price in closes[1:]:
-        ema.append(price * k + ema[-1] * (1.0 - k))
-    return ema
-
-
+# ==================== РАСЧЕТ HEIKIN ASHI, 6H И RSI ====================
 def calculate_rsi_series(closes: list, period: int = 14) -> list:
     n = len(closes)
     if n < period + 1:
@@ -217,9 +208,28 @@ def calculate_rsi_series(closes: list, period: int = 14) -> list:
     return rsi
 
 
+def build_6h_ohlcv_from_1h(ohlcv_1h: list) -> list:
+    six_h_ms = 6 * 3600 * 1000
+    buckets = {}
+    for c in ohlcv_1h:
+        ts, o, h, l, cl, v = c
+        b_ts = (ts // six_h_ms) * six_h_ms
+        if b_ts not in buckets:
+            buckets[b_ts] = [b_ts, o, h, l, cl, v]
+        else:
+            b = buckets[b_ts]
+            if h > b[2]:
+                b[2] = h
+            if l < b[3]:
+                b[3] = l
+            b[4] = cl
+            b[5] += v
+
+    return [buckets[k] for k in sorted(buckets.keys())]
+
+
 def calculate_heikin_ashi(ohlcv):
     closes = [c[4] for c in ohlcv]
-    ema_series = calculate_ema_series(closes, EMA_PERIOD)
     rsi_series = calculate_rsi_series(closes, RSI_PERIOD)
 
     ha_candles = []
@@ -256,7 +266,6 @@ def calculate_heikin_ashi(ohlcv):
             "real_close": c,
             "body_pct": body_pct,
             "color": color,
-            "ema": ema_series[i],
             "rsi": rsi_series[i]
         })
     return ha_candles
@@ -272,6 +281,17 @@ def count_consecutive_color(ha_candles, start_index, target_color):
     return count
 
 
+def get_htf_color(ha_candles: list) -> str:
+    if not ha_candles:
+        return "DOJI"
+    last_c = ha_candles[-1]
+    if last_c["color"] != "DOJI" and last_c["body_pct"] >= 0.03:
+        return last_c["color"]
+    if len(ha_candles) >= 2:
+        return ha_candles[-2]["color"]
+    return last_c["color"]
+
+
 # ==================== TELEGRAM: УВЕДОМЛЕНИЯ И КНОПКИ ====================
 def build_signal_message(data: dict) -> str:
     ticker = data["ticker"]
@@ -283,19 +303,19 @@ def build_signal_message(data: dict) -> str:
     rev_pct = float(data["reversal_body_pct"])
     live_pct = float(data["live_body_pct"])
     rsi_val = float(data.get("rsi_value", 50.0))
-    trend_mode = data.get("trend_mode", "По тренду")
-    trigger_reason = data.get("trigger_reason", "Глубокий откат")
+    mtf_mode = data.get("mtf_mode", "1D + 6H + 1H")
+    trigger_reason = data.get("trigger_reason", "Откат + Отбой")
     status = data["status"]
 
-    mexc_pair = ticker[:-4] + "_USDT" if ticker.endswith("USDT") else ticker
-    chart_url = f"https://futures.mexc.com/exchange/{mexc_pair}"
+    bingx_pair = ticker[:-4] + "-USDT" if ticker.endswith("USDT") and "-" not in ticker else ticker
+    chart_url = f"https://bingx.com/ru-ru/perpetual/{bingx_pair}"
 
     if direction == "SHORT":
-        header = "🔴 <b>СИГНАЛ: SHORT (ВНИЗ)</b>"
-        chain = f"{'🟢' * min(streak, 6)} ({streak} закр.) ➔ 🔴 (1 закр.) ➔ ⚡ {trigger_reason}"
+        header = "🔴 <b>СИГНАЛ BINGX: SHORT (ВНИЗ)</b>"
+        chain = f"{'🟢' * min(streak, 6)} ({streak} закр.) ➔ 🔴 (1 закр.) ➔ 🎯 {trigger_reason}"
     else:
-        header = "🟢 <b>СИГНАЛ: LONG (ВВЕРХ)</b>"
-        chain = f"{'🔴' * min(streak, 6)} ({streak} закр.) ➔ 🟢 (1 закр.) ➔ ⚡ {trigger_reason}"
+        header = "🟢 <b>СИГНАЛ BINGX: LONG (ВВЕРХ)</b>"
+        chain = f"{'🔴' * min(streak, 6)} ({streak} закр.) ➔ 🟢 (1 закр.) ➔ 🎯 {trigger_reason}"
 
     if status == "ЗАШЕЛ":
         status_line = "✅ <b>Результат: СИГНАЛ ЗАШЕЛ</b>"
@@ -307,18 +327,18 @@ def build_signal_message(data: dict) -> str:
     lines = [
         header,
         "",
-        f"📌 <b>Пара:</b> <code>{ticker}</code> (<a href='{chart_url}'>Открыть график</a>)",
+        f"📌 <b>Пара:</b> <code>{bingx_pair}</code> (<a href='{chart_url}'>График BingX</a>)",
         f"💰 <b>Цена входа:</b> <code>{price}</code>",
-        f"🧭 <b>Режим фильтра:</b> {trend_mode}",
-        f"📈 <b>RSI ({RSI_PERIOD}):</b> {rsi_val:.1f}",
-        f"🎯 <b>Триггер:</b> {trigger_reason}",
-        f"🕒 <b>Время (MEXC):</b> {dt_str} UTC",
+        f"🧭 <b>Старшие ТФ:</b> {mtf_mode}",
+        f"📈 <b>RSI (1H):</b> {rsi_val:.1f}",
+        f"🎯 <b>Точка входа:</b> {trigger_reason}",
+        f"🕒 <b>Время:</b> {dt_str} UTC",
         f"⏱ <b>До закрытия 1H свечи:</b> {rem_min:.1f} мин.",
         "",
         "📊 <b>Цепочка Heikin Ashi (1H):</b>",
         chain,
-        f"▪️ Тело разворотной свечи: {rev_pct:.3f}%",
-        f"▪️ Тело живой свечи HA: {live_pct:.3f}%",
+        f"▪️ Сила разворотной свечи: {rev_pct:.3f}%",
+        f"▪️ Текущее тело HA: {live_pct:.3f}%",
         "",
         status_line
     ]
@@ -369,7 +389,7 @@ async def send_telegram_file(session: aiohttp.ClientSession, chat_id: str):
 
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
-    form.add_field("caption", "📁 Файл статистики сигналов.")
+    form.add_field("caption", "📁 Файл статистики сигналов (BingX Futures).")
     form.add_field("document", file_bytes, filename="signals_log.csv", content_type="text/csv")
     try:
         async with session.post(url, data=form, timeout=20) as resp:
@@ -461,6 +481,24 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                         })
                     elif text.startswith("/export"):
                         await send_telegram_file(session, chat_id)
+                    elif text.startswith("/test"):
+                        test_data = {
+                            "signal_id": "TEST_0",
+                            "signal_time_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "ticker": "BTCUSDT",
+                            "direction": "SHORT",
+                            "entry_price": "68450.0",
+                            "remaining_minutes": "42.5",
+                            "streak_candles": 4,
+                            "reversal_body_pct": "0.4500",
+                            "live_body_pct": "0.1900",
+                            "rsi_value": "71.2",
+                            "mtf_mode": "1D (🔴) + 6H (🔴) По тренду",
+                            "trigger_reason": "Пик +0.72% ➔ Отбой вниз -0.24%",
+                            "status": "ОЖИДАЕТ",
+                            "updated_time_utc": ""
+                        }
+                        await send_telegram_signal(session, test_data)
                     elif text.startswith("/status") or text.startswith("/start"):
                         items = [
                             f"{k} ({v['target_dir']}, RSI:{v['peak_rsi']:.0f})"
@@ -471,14 +509,14 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
                         else:
                             cand_list = ", ".join(items) or "нет кандидатов в этом часе"
 
-                        scan_state = "⏳ Идет сканирование рынка..." if is_scanning else "✅ Готово"
+                        scan_state = "⏳ Идет сканирование BingX..." if is_scanning else "✅ Готово"
                         saved_cid = get_target_chat_id()
                         status_lines = [
-                            "🤖 <b>Бот ВСЕ ФЬЮЧЕРСЫ MEXC (HA + Pullback + RSI/EMA)</b>",
+                            "🤖 <b>Бот BingX Futures (1D ➔ 6H ➔ 1H + Отбой)</b>",
                             f"📩 <b>Chat ID:</b> <code>{saved_cid}</code> (подключен ✅)",
-                            f"📊 <b>Всего фьючерсов в работе:</b> {len(active_symbols)} пар (USDT-M)",
-                            f"🔄 <b>Статус сканера часа:</b> {scan_state}",
-                            f"⚙️ <b>Откат:</b> от {MIN_PULLBACK_PCT}% | <b>EMA:</b> {EMA_PERIOD} | <b>RSI:</b> {RSI_PERIOD}",
+                            f"💧 <b>Ликвидных пар в работе:</b> {len(active_symbols)} (объем &gt;= $1.5M)",
+                            f"🔄 <b>Статус сканера:</b> {scan_state}",
+                            f"⚙️ <b>Вход:</b> Откат от {MIN_PULLBACK_PCT}% ➔ Отбой от пика {MIN_BOUNCE_PCT}%",
                             f"🎯 <b>Кандидаты текущего часа ({len(hourly_candidates)}):</b>",
                             f"<code>{cand_list}</code>"
                         ]
@@ -495,25 +533,49 @@ async def telegram_polling_worker(session: aiohttp.ClientSession):
             await asyncio.sleep(5)
 
 
-# ==================== АВТОЗАГРУЗКА ВСЕХ ФЬЮЧЕРСОВ MEXC ====================
-async def load_all_mexc_usdt_swaps(exchange):
-    """
-    Загружает абсолютно все активные бессрочные USDT-фьючерсы на бирже MEXC.
-    """
+# ==================== ЗАГРУЗКА ЛИКВИДНЫХ ФЬЮЧЕРСОВ BINGX ====================
+async def load_liquid_bingx_swaps(exchange):
     markets = await exchange.load_markets(True)
-    resolved = {}
+    all_swaps = {}
 
     for sym, m in markets.items():
         if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True):
-            raw_id = m.get("id", "").replace("_", "")
+            raw_id = m.get("id", "").replace("-", "").replace("_", "")
             if not raw_id:
                 raw_id = sym.split(":")[0].replace("/", "")
-            resolved[raw_id] = sym
+            all_swaps[sym] = raw_id
 
-    print(f"[Инициализация] Загружено ВСЕХ активных USDT-фьючерсов MEXC: {len(resolved)}", flush=True)
-    return resolved
+    liquid_resolved = {}
+    try:
+        tickers = await exchange.fetch_tickers(list(all_swaps.keys()))
+        for sym, t in tickers.items():
+            if sym not in all_swaps:
+                continue
+            qv = t.get("quoteVolume")
+            if not qv:
+                info = t.get("info", {})
+                qv = float(info.get("quoteVolume") or info.get("turnover") or 0.0)
+            if not qv and t.get("baseVolume") and t.get("last"):
+                qv = float(t["baseVolume"]) * float(t["last"])
+
+            if qv and float(qv) >= MIN_24H_VOLUME_USDT:
+                raw_id = all_swaps[sym]
+                liquid_resolved[raw_id] = sym
+    except Exception as e:
+        print(f"[Предупреждение] Не удалось отфильтровать объем через fetch_tickers ({e}), берем все пары.", flush=True)
+
+    if len(liquid_resolved) < 20:
+        for sym, raw_id in all_swaps.items():
+            liquid_resolved[raw_id] = sym
+
+    print(
+        f"[BingX Инициализация] Отобрано ликвидных USDT-фьючерсов: {len(liquid_resolved)} из {len(all_swaps)}",
+        flush=True
+    )
+    return liquid_resolved
 
 
+# ==================== ЭТАПЫ 1-3: ВОРОНКА 1D -> 6H -> 1H ====================
 async def scan_hourly_candidates(exchange, hour_open_ts):
     global is_scanning
     is_scanning = True
@@ -524,64 +586,103 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
 
     async def check_one(ticker, ccxt_sym):
         async with sem:
+            await asyncio.sleep(0.04)
             try:
-                ohlcv = await exchange.fetch_ohlcv(ccxt_sym, timeframe=TIMEFRAME, limit=HISTORY_LIMIT)
+                ohlcv_1h = await exchange.fetch_ohlcv(ccxt_sym, timeframe="1h", limit=HISTORY_LIMIT)
             except Exception:
                 return
 
-            if not ohlcv or len(ohlcv) < 55:
+            if not ohlcv_1h or len(ohlcv_1h) < 55:
                 return
 
-            closed_candles = [c for c in ohlcv if c[0] < hour_open_ts]
-
-            if len(closed_candles) < 55 or closed_candles[-1][0] != prev_closed_ts:
+            closed_1h = [c for c in ohlcv_1h if c[0] < hour_open_ts]
+            if len(closed_1h) < 40 or closed_1h[-1][0] != prev_closed_ts:
                 return
 
-            ha_closed = calculate_heikin_ashi(closed_candles)
-            reversal_candle = ha_closed[-1]
-            idx_before_rev = len(ha_closed) - 2
+            ha_1h = calculate_heikin_ashi(closed_1h)
+            reversal_1h = ha_1h[-1]
+            idx_before_rev = len(ha_1h) - 2
 
-            recent_ranges = [abs(c["real_high"] - c["real_low"]) for c in ha_closed[-5:]]
+            # 1. Проверяем серию 3+ одноцветных свечей и разворотную свечу на 1H
+            target_dir = None
+            streak_1h = 0
+
+            if reversal_1h["color"] == "RED":
+                streak_1h = count_consecutive_color(ha_1h, idx_before_rev, "GREEN")
+                if streak_1h >= 3:
+                    target_dir = "SHORT"
+            elif reversal_1h["color"] == "GREEN":
+                streak_1h = count_consecutive_color(ha_1h, idx_before_rev, "RED")
+                if streak_1h >= 3:
+                    target_dir = "LONG"
+
+            if not target_dir:
+                return
+
+            # 2. Фильтр силы разворотной свечи (отсекаем слабые микро-свечи)
+            streak_slice = ha_1h[idx_before_rev - streak_1h + 1 : idx_before_rev + 1]
+            avg_streak_body = sum(c["body_pct"] for c in streak_slice) / len(streak_slice)
+            if reversal_1h["body_pct"] < max(REV_MIN_ABS_BODY_PCT, avg_streak_body * REV_MIN_STRENGTH_RATIO):
+                return
+
+            # 3. Проверяем 6-часовой таймфрейм (6H HA должен смотреть в сторону сделки)
+            ohlcv_6h = build_6h_ohlcv_from_1h(closed_1h)
+            ha_6h = calculate_heikin_ashi(ohlcv_6h)
+            color_6h = get_htf_color(ha_6h)
+
+            if target_dir == "SHORT" and color_6h != "RED":
+                return
+            if target_dir == "LONG" and color_6h != "GREEN":
+                return
+
+            # 4. Проверяем Дневной таймфрейм (1D HA в цвет сделки ИЛИ экстремальный RSI на 1H)
+            try:
+                ohlcv_1d = await exchange.fetch_ohlcv(ccxt_sym, timeframe="1d", limit=40)
+            except Exception:
+                return
+
+            if not ohlcv_1d or len(ohlcv_1d) < 5:
+                return
+
+            ha_1d = calculate_heikin_ashi(ohlcv_1d)
+            color_1d = get_htf_color(ha_1d)
+            recent_rsi = [c["rsi"] for c in ha_1h[-3:]]
+
+            mtf_mode = None
+            peak_rsi = reversal_1h["rsi"]
+
+            if target_dir == "SHORT":
+                peak_rsi = max(recent_rsi)
+                if color_1d == "RED" and peak_rsi >= 48.0:
+                    mtf_mode = "1D (🔴) + 6H (🔴) По тренду"
+                elif peak_rsi >= RSI_SHORT_OVERBOUGHT:
+                    mtf_mode = f"6H (🔴) + Перекупленность RSI {peak_rsi:.0f}"
+            else:
+                peak_rsi = min(recent_rsi)
+                if color_1d == "GREEN" and peak_rsi <= 52.0:
+                    mtf_mode = "1D (🟢) + 6H (🟢) По тренду"
+                elif peak_rsi <= RSI_LONG_OVERSOLD:
+                    mtf_mode = f"6H (🟢) + Перепроданность RSI {peak_rsi:.0f}"
+
+            if not mtf_mode:
+                return
+
+            recent_ranges = [abs(c["real_high"] - c["real_low"]) for c in ha_1h[-5:]]
             avg_recent_range = sum(recent_ranges) / len(recent_ranges)
             rev_real_range = max(
-                abs(reversal_candle["real_open"] - reversal_candle["real_close"]),
-                abs(reversal_candle["ha_open"] - reversal_candle["ha_close"]),
-                avg_recent_range * 0.6
+                abs(reversal_1h["real_open"] - reversal_1h["real_close"]),
+                abs(reversal_1h["ha_open"] - reversal_1h["ha_close"]),
+                avg_recent_range * 0.55
             )
 
-            recent_rsi_list = [c["rsi"] for c in ha_closed[-3:]]
-
-            if reversal_candle["color"] == "RED":
-                streak = count_consecutive_color(ha_closed, idx_before_rev, "GREEN")
-                if streak >= 3:
-                    max_rsi = max(recent_rsi_list)
-                    is_downtrend = reversal_candle["real_close"] < reversal_candle["ema"]
-                    if (is_downtrend and max_rsi >= RSI_SHORT_TREND - 3.0) or (max_rsi >= RSI_SHORT_OVERBOUGHT - 3.0):
-                        candidates[ticker] = {
-                            "target_dir": "SHORT",
-                            "target_live_color": "GREEN",
-                            "streak": streak,
-                            "rev_body_pct": reversal_candle["body_pct"],
-                            "rev_close_price": reversal_candle["real_close"],
-                            "rev_range": rev_real_range,
-                            "peak_rsi": max_rsi
-                        }
-
-            elif reversal_candle["color"] == "GREEN":
-                streak = count_consecutive_color(ha_closed, idx_before_rev, "RED")
-                if streak >= 3:
-                    min_rsi = min(recent_rsi_list)
-                    is_uptrend = reversal_candle["real_close"] > reversal_candle["ema"]
-                    if (is_uptrend and min_rsi <= RSI_LONG_TREND + 3.0) or (min_rsi <= RSI_LONG_OVERSOLD + 3.0):
-                        candidates[ticker] = {
-                            "target_dir": "LONG",
-                            "target_live_color": "RED",
-                            "streak": streak,
-                            "rev_body_pct": reversal_candle["body_pct"],
-                            "rev_close_price": reversal_candle["real_close"],
-                            "rev_range": rev_real_range,
-                            "peak_rsi": min_rsi
-                        }
+            candidates[ticker] = {
+                "target_dir": target_dir,
+                "streak": streak_1h,
+                "rev_body_pct": reversal_1h["body_pct"],
+                "rev_range": rev_real_range,
+                "peak_rsi": peak_rsi,
+                "mtf_mode": mtf_mode
+            }
 
     try:
         await asyncio.gather(*(check_one(t, s) for t, s in active_symbols.items()))
@@ -591,6 +692,7 @@ async def scan_hourly_candidates(exchange, hour_open_ts):
     return candidates
 
 
+# ==================== ЭТАП 4: СНАЙПЕРСКИЙ ВХОД НА ЗАТУХАНИИ ОТКАТА ====================
 async def monitor_candidate_live(exchange, session, sem, ticker, info, server_time_ms, hour_open_ts, rem_min):
     if (ticker, hour_open_ts) in sent_signals or ticker not in active_symbols:
         return
@@ -598,11 +700,11 @@ async def monitor_candidate_live(exchange, session, sem, ticker, info, server_ti
     ccxt_sym = active_symbols[ticker]
     async with sem:
         try:
-            ohlcv = await exchange.fetch_ohlcv(ccxt_sym, timeframe=TIMEFRAME, limit=HISTORY_LIMIT)
+            ohlcv = await exchange.fetch_ohlcv(ccxt_sym, timeframe="1h", limit=50)
         except Exception:
             return
 
-    if not ohlcv or len(ohlcv) < 55:
+    if not ohlcv or len(ohlcv) < 20:
         return
 
     ha_candles = calculate_heikin_ashi(ohlcv)
@@ -611,54 +713,56 @@ async def monitor_candidate_live(exchange, session, sem, ticker, info, server_ti
     if live_candle["timestamp"] != hour_open_ts:
         return
 
-    current_price = live_candle["real_close"]
     open_price = live_candle["real_open"]
-    ema_val = live_candle["ema"]
-    live_rsi = live_candle["rsi"]
+    current_price = live_candle["real_close"]
+    high_price = live_candle["real_high"]
+    low_price = live_candle["real_low"]
     rev_range = info["rev_range"]
     target_dir = info["target_dir"]
 
     trigger_reason = None
-    trend_mode = None
-    effective_rsi = live_rsi
 
-    if target_dir == "SHORT" and current_price > open_price:
-        pullback_abs = current_price - open_price
-        pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
-        retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
+    if target_dir == "SHORT":
+        # ФАЗА 1: Был ли достаточный заброс цены ВВЕРХ (откат) от открытия часа
+        max_pullback_abs = high_price - open_price
+        max_pullback_pct = (max_pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
+        retrace_ratio = (max_pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
-            effective_rsi = max(live_rsi, info["peak_rsi"])
-            in_downtrend = current_price < ema_val
+        pullback_ok = (
+            max_pullback_pct >= MIN_PULLBACK_PCT
+            and (retrace_ratio >= PULLBACK_RETRACE_RATIO or max_pullback_pct >= DIRECT_PULLBACK_PCT)
+        )
 
-            if in_downtrend and effective_rsi >= RSI_SHORT_TREND:
-                trend_mode = f"По тренду вниз (&lt; EMA{EMA_PERIOD}) + RSI {effective_rsi:.1f}"
-            elif effective_rsi >= RSI_SHORT_OVERBOUGHT:
-                trend_mode = f"Перекупленность (RSI {effective_rsi:.1f} &gt;= {RSI_SHORT_OVERBOUGHT:.0f})"
+        # ФАЗА 2: Остановился ли откат и пошла ли цена обратно ВНИЗ от максимума свечи
+        if pullback_ok and current_price > open_price:
+            bounce_abs = high_price - current_price
+            bounce_pct = (bounce_abs / high_price) * 100.0 if high_price > 0 else 0.0
+            bounce_ratio = (bounce_abs / max_pullback_abs) if max_pullback_abs > 0 else 0.0
 
-            if trend_mode:
-                ha_tag = "Зеленая HA + " if live_candle["color"] == "GREEN" else ""
-                trigger_reason = f"{ha_tag}Откат вверх +{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
+            if bounce_pct >= MIN_BOUNCE_PCT and 0.22 <= bounce_ratio <= 0.85:
+                trigger_reason = f"Пик +{max_pullback_pct:.2f}% ➔ Отбой вниз -{bounce_pct:.2f}%"
 
-    elif target_dir == "LONG" and current_price < open_price:
-        pullback_abs = open_price - current_price
-        pullback_pct = (pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
-        retrace_ratio = (pullback_abs / rev_range) if rev_range > 0 else 0.0
+    elif target_dir == "LONG":
+        # ФАЗА 1: Был ли достаточный пролив цены ВНИЗ (откат) от открытия часа
+        max_pullback_abs = open_price - low_price
+        max_pullback_pct = (max_pullback_abs / open_price) * 100.0 if open_price > 0 else 0.0
+        retrace_ratio = (max_pullback_abs / rev_range) if rev_range > 0 else 0.0
 
-        if pullback_pct >= MIN_PULLBACK_PCT and (retrace_ratio >= PULLBACK_RETRACE_RATIO or pullback_pct >= DIRECT_PULLBACK_PCT):
-            effective_rsi = min(live_rsi, info["peak_rsi"])
-            in_uptrend = current_price > ema_val
+        pullback_ok = (
+            max_pullback_pct >= MIN_PULLBACK_PCT
+            and (retrace_ratio >= PULLBACK_RETRACE_RATIO or max_pullback_pct >= DIRECT_PULLBACK_PCT)
+        )
 
-            if in_uptrend and effective_rsi <= RSI_LONG_TREND:
-                trend_mode = f"По тренду вверх (&gt; EMA{EMA_PERIOD}) + RSI {effective_rsi:.1f}"
-            elif effective_rsi <= RSI_LONG_OVERSOLD:
-                trend_mode = f"Перепроданность (RSI {effective_rsi:.1f} &lt;= {RSI_LONG_OVERSOLD:.0f})"
+        # ФАЗА 2: Остановился ли откат и пошла ли цена обратно ВВЕРХ от минимума свечи
+        if pullback_ok and current_price < open_price:
+            bounce_abs = current_price - low_price
+            bounce_pct = (bounce_abs / low_price) * 100.0 if low_price > 0 else 0.0
+            bounce_ratio = (bounce_abs / max_pullback_abs) if max_pullback_abs > 0 else 0.0
 
-            if trend_mode:
-                ha_tag = "Красная HA + " if live_candle["color"] == "RED" else ""
-                trigger_reason = f"{ha_tag}Откат вниз -{pullback_pct:.2f}% ({retrace_ratio*100:.0f}% размаха)"
+            if bounce_pct >= MIN_BOUNCE_PCT and 0.22 <= bounce_ratio <= 0.85:
+                trigger_reason = f"Дно -{max_pullback_pct:.2f}% ➔ Отбой вверх +{bounce_pct:.2f}%"
 
-    if trigger_reason and trend_mode:
+    if trigger_reason:
         trigger_confirm_counter[ticker] = trigger_confirm_counter.get(ticker, 0) + 1
     else:
         trigger_confirm_counter[ticker] = 0
@@ -670,7 +774,6 @@ async def monitor_candidate_live(exchange, session, sem, ticker, info, server_ti
         ).strftime("%Y-%m-%d %H:%M:%S")
 
         signal_id = f"{ticker}_{hour_open_ts // 1000}"
-        clean_trend_csv = trend_mode.replace("&lt;", "<").replace("&gt;", ">")
         signal_data = {
             "signal_id": signal_id,
             "signal_time_utc": dt_str,
@@ -681,8 +784,8 @@ async def monitor_candidate_live(exchange, session, sem, ticker, info, server_ti
             "streak_candles": info["streak"],
             "reversal_body_pct": f"{info['rev_body_pct']:.4f}",
             "live_body_pct": f"{live_candle['body_pct']:.4f}",
-            "rsi_value": f"{effective_rsi:.1f}",
-            "trend_mode": clean_trend_csv,
+            "rsi_value": f"{info['peak_rsi']:.1f}",
+            "mtf_mode": info["mtf_mode"],
             "trigger_reason": trigger_reason,
             "status": "ОЖИДАЕТ",
             "updated_time_utc": dt_str
@@ -693,18 +796,27 @@ async def monitor_candidate_live(exchange, session, sem, ticker, info, server_ti
             sent_signals.add((ticker, hour_open_ts))
             log_new_signal(signal_data)
             print(
-                f"[СИГНАЛ ОТПРАВЛЕН] {ticker} -> {target_dir} | {clean_trend_csv} | {trigger_reason} | Цена: {current_price}",
+                f"[СИГНАЛ BINGX] {ticker} -> {target_dir} | {info['mtf_mode']} | {trigger_reason} | Цена: {current_price}",
                 flush=True
             )
 
 
 # ==================== ТОЧКА ВХОДА ====================
+async def get_exchange_time_ms(exchange) -> int:
+    try:
+        t = await exchange.fetch_time()
+        if t:
+            return int(t)
+    except Exception:
+        pass
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+
+
 async def main():
     global active_symbols, current_hour_ts, hourly_candidates, trigger_confirm_counter
 
     init_csv()
-    # Отключаем встроенный тормоз enableRateLimit и управляем скоростью через Semaphore(15)
-    exchange = ccxt.mexc({
+    exchange = ccxt.bingx({
         "enableRateLimit": False,
         "options": {"defaultType": "swap"}
     })
@@ -712,14 +824,14 @@ async def main():
     live_sem = asyncio.Semaphore(LIVE_CONCURRENCY)
 
     async with aiohttp.ClientSession() as session:
-        active_symbols = await load_all_mexc_usdt_swaps(exchange)
+        active_symbols = await load_liquid_bingx_swaps(exchange)
         tg_task = asyncio.create_task(telegram_polling_worker(session))
 
-        print("Бот успешно запущен и отслеживает ВСЕ фьючерсы MEXC...", flush=True)
+        print("Бот успешно запущен и отслеживает ликвидные фьючерсы BingX...", flush=True)
         try:
             while True:
                 try:
-                    server_time_ms = await exchange.fetch_time()
+                    server_time_ms = await get_exchange_time_ms(exchange)
                     hour_ms = 3600 * 1000
                     hour_open_ts = (server_time_ms // hour_ms) * hour_ms
                     hour_close_ts = hour_open_ts + hour_ms
@@ -729,18 +841,17 @@ async def main():
                         current_hour_ts = hour_open_ts
                         trigger_confirm_counter.clear()
 
-                        # Раз в час обновляем список фьючерсов на случай новых листингов
                         try:
-                            active_symbols = await load_all_mexc_usdt_swaps(exchange)
+                            active_symbols = await load_liquid_bingx_swaps(exchange)
                         except Exception:
                             pass
 
-                        print(f"\n[Новый час] Сканирование всех {len(active_symbols)} фьючерсов MEXC...", flush=True)
+                        print(f"\n[Новый час] Сканирование {len(active_symbols)} ликвидных пар BingX...", flush=True)
                         t0 = datetime.datetime.now()
                         hourly_candidates = await scan_hourly_candidates(exchange, hour_open_ts)
                         elapsed = (datetime.datetime.now() - t0).total_seconds()
                         print(
-                            f"[Кандидаты часа] Проверено за {elapsed:.1f} сек. Найдено сетапов: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}",
+                            f"[Кандидаты BingX] Проверено за {elapsed:.1f} сек. Найдено: {len(hourly_candidates)} -> {list(hourly_candidates.keys())}",
                             flush=True
                         )
 
