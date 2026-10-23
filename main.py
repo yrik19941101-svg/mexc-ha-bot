@@ -1,13 +1,12 @@
 import asyncio
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА ПО ВАШИМ ПРАВИЛАМ ====================
+# ==================== НАСТРОЙКИ БЭКТЕСТА ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 60           # Глубина истории (60 дней)
-INITIAL_TRADE_AMOUNT = 1.0      # Начальная маржа ($1)
-MULTIPLIER_AFTER_LOSS = 1.2     # Умножение маржи после убытка
-SL_PERCENT_OF_MARGIN = 0.90     # Стоп-лосс: -90% от текущей маржи
-TP_PERCENT_OF_MARGIN = 1.10     # Тейк-профит: +110% от текущей маржи
+FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1), без умножения
+SL_PERCENT_OF_MARGIN = 0.90     # Стоп-лосс: -90% от маржи
+TP_PERCENT_OF_MARGIN = 2.00     # Тейк-профит: +200% от маржи
 ASSUMED_LEVERAGE = 20           # Плечо для расчета ценового расстояния
 MIN_REMAINING_MINUTES = 30.0    # До закрытия свечи должно оставаться не менее 30 мин
 
@@ -36,7 +35,7 @@ def calculate_heikin_ashi(ohlcv):
 
 
 async def run_backtest():
-    print("🚀 Запуск бэктеста по всем фьючерсным парам BingX...", flush=True)
+    print("🚀 Запуск бэктеста по всем фьючерсным парам BingX (TP 200%, без догона)...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
@@ -48,7 +47,6 @@ async def run_backtest():
     total_signals = 0
     wins = 0
     losses = 0
-    current_margin = INITIAL_TRADE_AMOUNT
     total_pnl_usd = 0.0
 
     for i, sym in enumerate(active_swaps):
@@ -57,22 +55,15 @@ async def run_backtest():
             if not ohlcv_1h or len(ohlcv_1h) < 50: 
                 continue
 
-            # Итерируемся по свечам, проверяя логику входа в течение часа
             for idx in range(1, len(ohlcv_1h) - 25):
                 prev_candle = ohlcv_1h[idx - 1]
                 curr_candle = ohlcv_1h[idx]
                 
-                # Сигнал: закрылась красная или зеленая свеча
-                # Для упрощения бэктеста на исторических 1H барах проверяем смену цвета тела
-                # (в реальном времени бот ловит момент смены цвета внутри текущей свечи)
                 p_open, p_close = prev_candle[1], prev_candle[4]
                 prev_color = "GREEN" if p_close > p_open else "RED"
 
                 c_open, c_high, c_low, c_close = curr_candle[1], curr_candle[2], curr_candle[3], curr_candle[4]
                 
-                # Логика входа:
-                # Если предыдущая красная -> ждем, пока текущая откатит вверх и станет зеленой (c_close > c_open)
-                # Если предыдущая зеленая -> ждем, пока текущая откатит вниз и станет красной (c_close < c_open)
                 target_dir = None
                 if prev_color == "RED" and c_close > c_open:
                     target_dir = "LONG"
@@ -85,9 +76,9 @@ async def run_backtest():
                 total_signals += 1
                 entry_p = c_close
                 
-                pos_size = current_margin * ASSUMED_LEVERAGE
-                sl_delta = (current_margin * SL_PERCENT_OF_MARGIN / pos_size) * entry_p
-                tp_delta = (current_margin * TP_PERCENT_OF_MARGIN / pos_size) * entry_p
+                pos_size = FIXED_TRADE_AMOUNT * ASSUMED_LEVERAGE
+                sl_delta = (FIXED_TRADE_AMOUNT * SL_PERCENT_OF_MARGIN / pos_size) * entry_p
+                tp_delta = (FIXED_TRADE_AMOUNT * TP_PERCENT_OF_MARGIN / pos_size) * entry_p
 
                 if target_dir == "LONG":
                     sl_price = entry_p - sl_delta
@@ -96,7 +87,6 @@ async def run_backtest():
                     sl_price = entry_p + sl_delta
                     tp_price = entry_p - tp_delta
 
-                # Проверка отработки сделки по будущим свечам
                 trade_result = None
                 for future_c in ohlcv_1h[idx : idx + 24]:
                     f_high = future_c[2]
@@ -129,12 +119,10 @@ async def run_backtest():
 
                 if trade_result == "WIN":
                     wins += 1
-                    total_pnl_usd += current_margin * (TP_PERCENT_OF_MARGIN / 100.0) * 100 # примерный расчет профита
-                    current_margin = INITIAL_TRADE_AMOUNT # сброс маржи после победы (или оставьте по вашей логике)
+                    total_pnl_usd += FIXED_TRADE_AMOUNT * TP_PERCENT_OF_MARGIN
                 elif trade_result == "LOSS":
                     losses += 1
-                    total_pnl_usd -= current_margin * SL_PERCENT_OF_MARGIN
-                    current_margin *= MULTIPLIER_AFTER_LOSS # догон после убытка
+                    total_pnl_usd -= FIXED_TRADE_AMOUNT * SL_PERCENT_OF_MARGIN
 
         except Exception as e:
             pass
@@ -142,14 +130,14 @@ async def run_backtest():
     await exchange.close()
 
     print("\n" + "="*45, flush=True)
-    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА ПО ВСЕМ ПАРАМ BINGX:", flush=True)
+    print("📈 РЕЗУЛЬТАТЫ БЭКТЕСТА (TP 200%, Фикс. маржа):", flush=True)
     print(f"Всего сделок: {total_signals}", flush=True)
-    print(f"✅ Успешных (TP +110%): {wins}", flush=True)
+    print(f"✅ Успешных (TP +200%): {wins}", flush=True)
     print(f"❌ Убыточных (SL -90%): {losses}", flush=True)
     marked = wins + losses
     winrate = (wins / marked * 100.0) if marked > 0 else 0.0
     print(f"🎯 Итоговый Винрейт: {winrate:.1f}%", flush=True)
-    print(f"💰 Итоговый PnL (без учета комиссий): ${total_pnl_usd:.2f}", flush=True)
+    print(f"💰 Итоговый PnL: ${total_pnl_usd:.2f}", flush=True)
     print("="*45, flush=True)
 
 if __name__ == "__main__":
