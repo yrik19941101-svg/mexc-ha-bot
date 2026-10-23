@@ -8,7 +8,7 @@ DAYS_TO_BACKTEST = 45           # Глубина истории для анал�
 FIXED_TRADE_AMOUNT = 1.0        # Фиксированная маржа ($1)
 ASSUMED_LEVERAGE = 20           # Плечо
 
-# Что именно будет перебирать оптимизатор (можешь менять списки под себя):
+# Что именно будет перебирать оптимизатор:
 TP_GRID = [1.0, 1.5, 2.0]       # Тейк-профит (% от маржи)
 SL_GRID = [0.7, 0.9, 1.1]       # Стоп-лосс (% от маржи)
 EMA_GRID = [20, 50, 100]        # Периоды EMA для тренда
@@ -55,31 +55,34 @@ async def run_optimizer():
     markets = await exchange.load_markets(True)
     active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)]
 
-    # Возьмем топ-40 пар по популярности/наличию для быстрого и качественного теста
+    # Возьмем топ-40 пар для быстрого и качественного теста
     active_swaps = active_swaps[:40]
 
     print(f"📊 Скачиваем историю для {len(active_swaps)} пар за {DAYS_TO_BACKTEST} дней...", flush=True)
     since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
 
-    # Кэшируем исторические свечи и уже готовые расчеты Heikin Ashi, чтобы не дергать биржу при переборе
     cached_market_data = {}
     for sym in active_swaps:
         try:
             ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_timestamp, limit=1200)
-            if ohlcv and len(ohlcv > 100):
+            # ИСПРАВЛЕНА ОШИБКА СКОБОК ЗДЕСЬ:
+            if ohlcv and len(ohlcv) > 100:
                 ha_candles = calculate_heikin_ashi(ohlcv)
                 closes = [c["real_close"] for c in ha_candles]
                 cached_market_data[sym] = {
                     "ha_candles": ha_candles,
                     "closes": closes
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки {sym}: {e}", flush=True)
 
     await exchange.close()
     print(f"💾 Успешно загружено и закешировано пар: {len(cached_market_data)}. Начинаем перебор комбинаций...", flush=True)
 
-    # Генерируем все возможные комбинации параметров
+    if len(cached_market_data) == 0:
+        print("❌ Не удалось загрузить ни одной пары. Проверьте интернет-соединение.", flush=True)
+        return
+
     combinations = list(product(TP_GRID, SL_GRID, EMA_GRID, BODY_GRID))
     print(f"🔬 Всего комбинаций для проверки: {len(combinations)}\n", flush=True)
 
@@ -107,7 +110,6 @@ async def run_optimizer():
                 current_price = curr_c["real_close"]
                 ema_val = ema_values[idx]
 
-                # Логика отката
                 if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
                     if current_price < ema_val:
                         target_dir = "SHORT"
@@ -172,13 +174,12 @@ async def run_optimizer():
         marked = wins + losses
         winrate = (wins / marked * 100.0) if marked > 0 else 0.0
 
-        if marked > 15: # Учитываем только конфигурации, где набралась статистическая база
+        if marked > 15:
             best_results.append({
                 "tp": tp_pct, "sl": sl_pct, "ema": ema_p, "body": min_body,
                 "signals": marked, "winrate": winrate, "pnl": total_pnl
             })
 
-    # Сортируем результаты по итоговому PnL (от лучших к худшим)
     best_results.sort(key=lambda x: x["pnl"], reverse=True)
 
     print("\n" + "="*60, flush=True)
