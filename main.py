@@ -12,8 +12,8 @@ ASSUMED_LEVERAGE = 20
 TP_GRID = [1.0, 1.5]
 SL_GRID = [0.9, 1.1]
 EMA_GRID = [20, 50]
-RSI_FILTER_ENABLED = [True, False]  # Проверим с RSI и без
-VOLUME_MULT_GRID = [1.0, 1.3]       # Множитель объема (1.0 = равен среднему, 1.3 = выше на 30%)
+RSI_FILTER_ENABLED = [True, False]
+VOLUME_MULT_GRID = [1.0, 1.3]
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -73,7 +73,7 @@ def calculate_rsi(closes, period=14):
             rs = avg_gain / avg_loss
             rsi.append(100.0 - (100.0 / (1.0 + rs)))
             
-    return [50.0] + rsi # Дополняем до длины closes
+    return [50.0] + rsi
 
 
 async def run_advanced_optimizer():
@@ -81,8 +81,9 @@ async def run_advanced_optimizer():
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
-    active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote"] == "USDT" and m.get("active", True)]
-    active_swaps = active_swaps[:35] # Топ-35 пар для скорости
+    # ИСПРАВЛЕНА СКОБКА ЗДЕСЬ 👇
+    active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)]
+    active_swaps = active_swaps[:35]
 
     print(f"📊 Скачиваем историю для {len(active_swaps)} пар...", flush=True)
     since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
@@ -103,11 +104,15 @@ async def run_advanced_optimizer():
                     "volumes": volumes,
                     "rsi": rsi_values
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки {sym}: {e}", flush=True)
 
     await exchange.close()
     print(f"💾 Закешировано пар: {len(cached_market_data)}. Перебираем комбинации...", flush=True)
+
+    if len(cached_market_data) == 0:
+        print("❌ Нет данных для анализа.", flush=True)
+        return
 
     combinations = list(product(TP_GRID, SL_GRID, EMA_GRID, RSI_FILTER_ENABLED, VOLUME_MULT_GRID))
     print(f"🔬 Всего комбинаций: {len(combinations)}\n", flush=True)
@@ -131,7 +136,6 @@ async def run_advanced_optimizer():
                 prev_c = ha_candles[idx - 1]
                 curr_c = ha_candles[idx]
                 
-                # Фильтр объема: текущий объем должен быть выше среднего за 20 баров * vol_mult
                 avg_vol = sum(volumes[idx-20:idx]) / 20 if idx >= 20 else volumes[idx]
                 if curr_c["volume"] < avg_vol * vol_mult:
                     continue
@@ -141,10 +145,9 @@ async def run_advanced_optimizer():
                 ema_val = ema_values[idx]
                 rsi_val = rsi_vals[idx]
 
-                # Логика отката
                 if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
                     if current_price < ema_val:
-                        if not use_rsi or (35 < rsi_val < 70): # RSI фильтр для шорта/лонга
+                        if not use_rsi or (35 < rsi_val < 70):
                             target_dir = "SHORT"
                 elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED":
                     if current_price > ema_val:
@@ -214,7 +217,7 @@ async def run_advanced_optimizer():
                 "signals": marked, "winrate": winrate, "pnl": total_pnl
             })
 
-    best_results.sort(key=lambda x: x["winrate"], reverse=True) # Сортируем именно по винрейту!
+    best_results.sort(key=lambda x: x["winrate"], reverse=True)
 
     print("\n" + "="*70, flush=True)
     print("🏆 ТОП-5 КОНФИГУРАЦИЙ ПО ВИНРЕЙТУ:", flush=True)
