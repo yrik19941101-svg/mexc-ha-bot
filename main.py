@@ -2,18 +2,18 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== РАСШИРЕННАЯ СЕТКА ПАРАМЕТРОВ ====================
+# ==================== НАСТРОЙКИ ПОИСКА 70%+ ВИНРЕЙТА ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 45
-FIXED_TRADE_AMOUNT = 1.0
-ASSUMED_LEVERAGE = 20
+FIXED_TRADE_AMOUNT = 10.0       # Рабочая маржа $10 на сделку
+ASSUMED_LEVERAGE = 20           # Плечо 20x
 
-# Новые сетки для перебора
-TP_GRID = [1.0, 1.5]
-SL_GRID = [0.9, 1.1]
-EMA_GRID = [20, 50]
-RSI_FILTER_ENABLED = [True, False]
-VOLUME_MULT_GRID = [1.0, 1.3]
+# Сетка параметров для достижения высокого винрейта:
+TP_GRID = [0.7, 0.9, 1.1]           # Тейк-профит (+70%, +90%, +110% от маржи)
+SL_GRID = [1.0, 1.2]                # Стоп-лосс (-100%, -120% от маржи)
+MIN_SERIES_GRID = [1, 2]            # Сколько свечей одного цвета должно быть перед откатом
+EMA_FAN_FILTER = [True, False]      # Требовать выстраивание Цена -> EMA 20 -> EMA 50
+USE_BREAKEVEN = [True, False]       # Перевод в безубыток при прохождении +45% профита
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -49,43 +49,15 @@ def calculate_ema(closes, period):
     return [ema[0]] * (period - 1) + ema
 
 
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return [50.0] * len(closes)
-    
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0.0 for d in deltas]
-    losses = [-d if d < 0 else 0.0 for d in deltas]
-    
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    
-    rsi = [50.0] * period
-    for i in range(period, len(deltas)):
-        gain = gains[i]
-        loss = losses[i]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        
-        if avg_loss == 0:
-            rsi.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            rsi.append(100.0 - (100.0 / (1.0 + rs)))
-            
-    return [50.0] + rsi
-
-
-async def run_advanced_optimizer():
-    print("🚀 Запуск расширенного оптимизатора (RSI + Объемы + EMA)...", flush=True)
+async def run_high_winrate_optimizer():
+    print("🚀 Запуск оптимизатора под высокий винрейт (70%+)...", flush=True)
     exchange = ccxt.bingx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     
     markets = await exchange.load_markets(True)
-    # ИСПРАВЛЕНА СКОБКА ЗДЕСЬ 👇
     active_swaps = [sym for sym, m in markets.items() if m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)]
-    active_swaps = active_swaps[:35]
+    active_swaps = active_swaps[:40]
 
-    print(f"📊 Скачиваем историю для {len(active_swaps)} пар...", flush=True)
+    print(f"📊 Скачиваем историю для {len(active_swaps)} пар за {DAYS_TO_BACKTEST} дней...", flush=True)
     since_timestamp = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
 
     cached_market_data = {}
@@ -95,14 +67,13 @@ async def run_advanced_optimizer():
             if ohlcv and len(ohlcv) > 100:
                 ha_candles = calculate_heikin_ashi(ohlcv)
                 closes = [c["real_close"] for c in ha_candles]
-                volumes = [c["volume"] for c in ha_candles]
-                rsi_values = calculate_rsi(closes, 14)
+                ema20 = calculate_ema(closes, 20)
+                ema50 = calculate_ema(closes, 50)
                 
                 cached_market_data[sym] = {
                     "ha_candles": ha_candles,
-                    "closes": closes,
-                    "volumes": volumes,
-                    "rsi": rsi_values
+                    "ema20": ema20,
+                    "ema50": ema50
                 }
         except Exception as e:
             print(f"⚠️ Ошибка загрузки {sym}: {e}", flush=True)
@@ -114,64 +85,74 @@ async def run_advanced_optimizer():
         print("❌ Нет данных для анализа.", flush=True)
         return
 
-    combinations = list(product(TP_GRID, SL_GRID, EMA_GRID, RSI_FILTER_ENABLED, VOLUME_MULT_GRID))
-    print(f"🔬 Всего комбинаций: {len(combinations)}\n", flush=True)
+    combinations = list(product(TP_GRID, SL_GRID, MIN_SERIES_GRID, EMA_FAN_FILTER, USE_BREAKEVEN))
+    print(f"🔬 Всего комбинаций для проверки: {len(combinations)}\n", flush=True)
 
     best_results = []
 
-    for tp_pct, sl_pct, ema_p, use_rsi, vol_mult in combinations:
-        total_signals = 0
+    for tp_pct, sl_pct, min_series, use_fan, use_be in combinations:
         wins = 0
         losses = 0
+        breakevens = 0
         total_pnl = 0.0
 
         for sym, data in cached_market_data.items():
             ha_candles = data["ha_candles"]
-            closes = data["closes"]
-            volumes = data["volumes"]
-            rsi_vals = data["rsi"]
-            ema_values = calculate_ema(closes, ema_p)
+            ema20 = data["ema20"]
+            ema50 = data["ema50"]
 
-            for idx in range(max(ema_p, 20), len(ha_candles) - 24):
-                prev_c = ha_candles[idx - 1]
+            for idx in range(55, len(ha_candles) - 24):
                 curr_c = ha_candles[idx]
-                
-                avg_vol = sum(volumes[idx-20:idx]) / 20 if idx >= 20 else volumes[idx]
-                if curr_c["volume"] < avg_vol * vol_mult:
+                if curr_c["body_pct"] < 0.001:
                     continue
 
+                # Проверяем серию предыдущих свечей одного цвета перед откатом
+                prev_colors = [ha_candles[idx - k]["color"] for k in range(1, min_series + 1)]
+                
                 target_dir = None
                 current_price = curr_c["real_close"]
-                ema_val = ema_values[idx]
-                rsi_val = rsi_vals[idx]
+                e20 = ema20[idx]
+                e50 = ema50[idx]
 
-                if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
-                    if current_price < ema_val:
-                        if not use_rsi or (35 < rsi_val < 70):
+                # Условие для SHORT: серия красных свечей + текущая откатила и стала зеленой
+                if all(c == "RED" for c in prev_colors) and curr_c["color"] == "GREEN":
+                    if use_fan:
+                        if current_price < e20 and e20 < e50:
                             target_dir = "SHORT"
-                elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED":
-                    if current_price > ema_val:
-                        if not use_rsi or (30 < rsi_val < 65):
+                    else:
+                        if current_price < e20:
+                            target_dir = "SHORT"
+
+                # Условие для LONG: серия зеленых свечей + текущая откатила и стала красной
+                elif all(c == "GREEN" for c in prev_colors) and curr_c["color"] == "RED":
+                    if use_fan:
+                        if current_price > e20 and e20 > e50:
+                            target_dir = "LONG"
+                    else:
+                        if current_price > e20:
                             target_dir = "LONG"
 
                 if not target_dir:
                     continue
 
-                total_signals += 1
                 entry_p = current_price
-                
                 pos_size = FIXED_TRADE_AMOUNT * ASSUMED_LEVERAGE
                 sl_delta = (FIXED_TRADE_AMOUNT * sl_pct / pos_size) * entry_p
                 tp_delta = (FIXED_TRADE_AMOUNT * tp_pct / pos_size) * entry_p
+                be_delta = (FIXED_TRADE_AMOUNT * 0.45 / pos_size) * entry_p  # Триггер БУ (+45% от маржи)
 
                 if target_dir == "LONG":
                     sl_price = entry_p - sl_delta
                     tp_price = entry_p + tp_delta
+                    be_trigger_price = entry_p + be_delta
                 else:
                     sl_price = entry_p + sl_delta
                     tp_price = entry_p - tp_delta
+                    be_trigger_price = entry_p - be_delta
 
                 trade_result = None
+                be_activated = False
+
                 for future_c in ha_candles[idx + 1 : idx + 25]:
                     f_high = future_c["real_high"]
                     f_low = future_c["real_low"]
@@ -180,26 +161,33 @@ async def run_advanced_optimizer():
                         hit_tp = f_high >= tp_price
                         hit_sl = f_low <= sl_price
                         if hit_tp and hit_sl:
-                            trade_result = "LOSS"
+                            trade_result = "BE" if be_activated else "LOSS"
                             break
                         elif hit_tp:
                             trade_result = "WIN"
                             break
                         elif hit_sl:
-                            trade_result = "LOSS"
+                            trade_result = "BE" if be_activated else "LOSS"
                             break
+                        # Активация безубытка для следующих свечей
+                        if use_be and not be_activated and f_high >= be_trigger_price:
+                            be_activated = True
+                            sl_price = entry_p
                     else:
                         hit_tp = f_low <= tp_price
                         hit_sl = f_high >= sl_price
                         if hit_tp and hit_sl:
-                            trade_result = "LOSS"
+                            trade_result = "BE" if be_activated else "LOSS"
                             break
                         elif hit_tp:
                             trade_result = "WIN"
                             break
                         elif hit_sl:
-                            trade_result = "LOSS"
+                            trade_result = "BE" if be_activated else "LOSS"
                             break
+                        if use_be and not be_activated and f_low <= be_trigger_price:
+                            be_activated = True
+                            sl_price = entry_p
 
                 if trade_result == "WIN":
                     wins += 1
@@ -207,24 +195,34 @@ async def run_advanced_optimizer():
                 elif trade_result == "LOSS":
                     losses += 1
                     total_pnl -= FIXED_TRADE_AMOUNT * sl_pct
+                elif trade_result == "BE":
+                    breakevens += 1
 
-        marked = wins + losses
-        winrate = (wins / marked * 100.0) if marked > 0 else 0.0
+        decided_trades = wins + losses
+        winrate = (wins / decided_trades * 100.0) if decided_trades > 0 else 0.0
 
-        if marked > 10:
+        if decided_trades >= 30 and total_pnl > 0:
             best_results.append({
-                "tp": tp_pct, "sl": sl_pct, "ema": ema_p, "rsi": use_rsi, "vol": vol_mult,
-                "signals": marked, "winrate": winrate, "pnl": total_pnl
+                "tp": tp_pct, "sl": sl_pct, "series": min_series,
+                "fan": use_fan, "be": use_be,
+                "wins": wins, "losses": losses, "be_count": breakevens,
+                "winrate": winrate, "pnl": total_pnl
             })
 
-    best_results.sort(key=lambda x: x["winrate"], reverse=True)
+    # Сортируем по винрейту среди прибыльных комбинаций
+    best_results.sort(key=lambda x: (x["winrate"], x["pnl"]), reverse=True)
 
-    print("\n" + "="*70, flush=True)
-    print("🏆 ТОП-5 КОНФИГУРАЦИЙ ПО ВИНРЕЙТУ:", flush=True)
-    print("="*70, flush=True)
-    for i, res in enumerate(best_results[:5], 1):
-        print(f"#{i} | Винрейт: {res['winrate']:.1f}% | TP: +{res['tp']*100:.0f}% | SL: -{res['sl']*100:.0f}% | EMA: {res['ema']} | RSI: {res['rsi']} | Объем x{res['vol']} | Сделок: {res['signals']} | PnL: ${res['pnl']:.2f}", flush=True)
-    print("="*70, flush=True)
+    print("\n" + "="*80, flush=True)
+    print("🏆 ТОП-7 КОНФИГУРАЦИЙ С МАКСИМАЛЬНЫМ ВИНРЕЙТОМ (Маржа $10 на сделку):", flush=True)
+    print("="*80, flush=True)
+    for i, res in enumerate(best_results[:7], 1):
+        print(
+            f"#{i} | 🎯 Винрейт: {res['winrate']:.1f}% (+{res['wins']} / -{res['losses']} / БУ:{res['be_count']}) | "
+            f"💰 PnL: ${res['pnl']:.2f} | TP: +{res['tp']*100:.0f}% | SL: -{res['sl']*100:.0f}% | "
+            f"Серия: {res['series']} | Веер EMA: {res['fan']} | БУ: {res['be']}",
+            flush=True
+        )
+    print("="*80, flush=True)
 
 if __name__ == "__main__":
-    asyncio.run(run_advanced_optimizer())
+    asyncio.run(run_high_winrate_optimizer())
