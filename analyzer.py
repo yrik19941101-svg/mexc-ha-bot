@@ -61,12 +61,12 @@ def backtest_strategy(df, symbol):
     initial_capital = 150.0
     capital = initial_capital
     
-    # Параметры изолированного Мартингейла для данной пары
-    base_stake = 0.50      # Начальная сумма риска $0.50
-    max_steps = 5          # Максимум 5 шагов ($0.5 -> $1 -> $2 -> $4 -> $8)
+    # Параметры Мартингейла v8.0: 8 шагов, коэффициент 1.5x, старт $0.50
+    base_stake = 0.50
+    max_steps = 8
     current_step = 1
     max_step_reached = 1
-    rr_ratio = 1.25        # Тейк-профит 1.25R (полностью перекрывает все предыдущие шаги с плюсом)
+    rr_ratio = 1.25
     
     opens = df['open'].values
     highs = df['high'].values
@@ -106,11 +106,10 @@ def backtest_strategy(df, symbol):
             continue
 
         # -------------------------------------------------------------------------
-        # 1. РЕГИСТРАЦИЯ СВЕЖИХ ЗОН СПРОСА И ПРЕДЛОЖЕНИЯ (С ПРОБОЕМ СТРУКТУРЫ)
+        # 1. РЕГИСТРАЦИЯ ЗОН СПРОСА И ПРЕДЛОЖЕНИЯ (С ПРОБОЕМ СТРУКТУРЫ BOS)
         # -------------------------------------------------------------------------
         p = i - 3
         if p >= 12:
-            # Зона Спроса (Swing Low + импульс вверх + обновление локального хая)
             is_swing_low = (lows[p] <= np.min(lows[p-5:p])) and (lows[p] <= np.min(lows[p+1:i+1]))
             impulse_up = (np.max(highs[p+1:i+1]) - lows[p]) >= (atrs[p] * 1.25)
             bos_up = np.max(closes[p+1:i+1]) > np.max(highs[p-4:p])
@@ -122,7 +121,6 @@ def backtest_strategy(df, symbol):
                     'bar': p
                 })
                 
-            # Зона Предложения (Swing High + импульс вниз + обновление локального лоя)
             is_swing_high = (highs[p] >= np.max(highs[p-5:p])) and (highs[p] >= np.max(highs[p+1:i+1]))
             impulse_down = (highs[p] - np.min(lows[p+1:i+1])) >= (atrs[p] * 1.25)
             bos_down = np.min(closes[p+1:i+1]) < np.min(lows[p-4:p])
@@ -134,7 +132,6 @@ def backtest_strategy(df, symbol):
                     'bar': p
                 })
 
-        # Очистка пробитых и устаревших зон (>120 часов)
         demand_zones = [
             z for z in demand_zones 
             if (curr_close >= z['bottom']) and (i - z['bar'] <= 120)
@@ -145,7 +142,7 @@ def backtest_strategy(df, symbol):
         ]
 
         # -------------------------------------------------------------------------
-        # 2. ПРОВЕРКА ЗАКРЫТИЯ ОТКРЫТОЙ СДЕЛКИ (ПОЛНЫЙ СТОП ИЛИ ПОЛНЫЙ ТЕЙК 1.25R)
+        # 2. ПРОВЕРКА ЗАКРЫТИЯ СДЕЛКИ И УПРАВЛЕНИЕ ШАГАМИ МАРТИНГЕЙЛА
         # -------------------------------------------------------------------------
         if in_position:
             if pos_type == 'LONG':
@@ -153,19 +150,17 @@ def backtest_strategy(df, symbol):
                     capital -= current_stake
                     trades.append('LOSS')
                     in_position = False
-                    # Увеличиваем шаг мартингейла для этой монеты
                     current_step += 1
                     if current_step > max_steps:
                         current_step = 1
-                    next_allowed_bar = i + 8  # Пауза 8 свечей после стопа, чтобы переждать пролив
+                    next_allowed_bar = i + 8
                     continue
                     
                 elif curr_high >= take_profit:
                     capital += current_stake * rr_ratio
                     trades.append('WIN')
                     in_position = False
-                    # Сброс мартингейла на 1 шаг после победы
-                    current_step = 1
+                    current_step = 1  # Сброс на 1 шаг при победе
                     next_allowed_bar = i + 2
                     continue
                     
@@ -194,7 +189,7 @@ def backtest_strategy(df, symbol):
             continue
 
         # -------------------------------------------------------------------------
-        # 3. ПОИСК ТОЧКИ ВХОДА ПО ТРЕНДУ ОТ ЗОНЫ С ПОДТВЕРЖДЕНИЕМ
+        # 3. ПОИСК ТОЧКИ ВХОДА (ТРЕНД + RSI + ЗОНА)
         # -------------------------------------------------------------------------
         uptrend = (curr_close > ema100[i]) and (ema20[i] >= ema50[i] * 0.997) and (ema100[i] >= ema100[i-4])
         downtrend = (curr_close < ema100[i]) and (ema20[i] <= ema50[i] * 1.003) and (ema100[i] <= ema100[i-4])
@@ -217,7 +212,6 @@ def backtest_strategy(df, symbol):
                 bull_pinbar = (curr_close > curr_open) and ((curr_close - curr_low) / candle_range >= 0.60) and (curr_close > closes[i-1])
                 
                 if rsi_ok and (bull_break or bull_pinbar):
-                    # Защищенный стоп-лосс за зоной с буфером 0.45 ATR от ложных заколов
                     stop_price = min(matched_zone['bottom'], curr_low, lows[i-1]) - (curr_atr * 0.45)
                     r_dist = curr_close - stop_price
                     
@@ -228,9 +222,11 @@ def backtest_strategy(df, symbol):
                         stop_loss = stop_price
                         take_profit = entry_price + (r_dist * rr_ratio)
                         
-                        current_stake = base_stake * (2 ** (current_step - 1))
+                        # Расчет ставки по Мартингейлу 1.5x для текущего шага
+                        current_stake = round(base_stake * (1.5 ** (current_step - 1)), 2)
                         if current_step > max_step_reached:
                             max_step_reached = current_step
+                            
                         demand_zones.remove(matched_zone)
                         continue
 
@@ -258,9 +254,10 @@ def backtest_strategy(df, symbol):
                         stop_loss = stop_price
                         take_profit = entry_price - (r_dist * rr_ratio)
                         
-                        current_stake = base_stake * (2 ** (current_step - 1))
+                        current_stake = round(base_stake * (1.5 ** (current_step - 1)), 2)
                         if current_step > max_step_reached:
                             max_step_reached = current_step
+                            
                         supply_zones.remove(matched_zone)
                         continue
 
@@ -281,7 +278,7 @@ def backtest_strategy(df, symbol):
 
 def main():
     exchange = ccxt.bybit()
-    print(f"Запуск бэктеста v7.0 (Изолированный Мартингейл 5 шагов от $0.50 + TP 1.25R)...\n")
+    print(f"Запуск бэктеста v8.0 (Мартингейл 8 шагов х1.5 + TP 1.25R)...\n")
     
     results = []
     for symbol in SYMBOLS:
@@ -300,7 +297,7 @@ def main():
         profitable_pairs = len(df_res[df_res['profit_usd'] > 0])
         total_profit = df_res['profit_usd'].sum()
         print("\n" + "="*65)
-        print(" ИТОГОВАЯ СВОДКА v7.0 (ИЗОЛИРОВАННЫЙ МАРТИНГЕЙЛ 5 ШАГОВ) ")
+        print(" ИТОГОВАЯ СВОДКА v8.0 (МАРТИНГЕЙЛ 8 ШАГОВ x1.5) ")
         print("="*65)
         print(f"Всего сделок по портфелю: {df_res['trades'].sum()}")
         print(f"Плюсовых пар из {len(df_res)}: {profitable_pairs}")
