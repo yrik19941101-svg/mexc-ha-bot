@@ -1,6 +1,7 @@
 import ccxt
 import pandas as pd
 import numpy as np
+import time
 
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
@@ -9,102 +10,193 @@ SYMBOLS = [
     'FIL/USDT', 'RENDER/USDT', 'ATOM/USDT', 'LTC/USDT', 'TIA/USDT'
 ]
 
-def fetch_historical_data(exchange, symbol, timeframe='4h', limit=400):
+def fetch_historical_data(exchange, symbol, timeframe='1h', days=60):
+    """Загрузка данных за 60 дней (1440 часовых свечей) в два запроса"""
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        now = exchange.milliseconds()
+        since = now - days * 24 * 60 * 60 * 1000
+        all_ohlcv = []
+        
+        while since < now:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1000)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            if len(ohlcv) < 1000:
+                break
+                
+        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
         return df
     except Exception as e:
+        print(f"Ошибка загрузки {symbol}: {e}")
         return None
 
-def find_market_structure(df, window=5):
-    """Поиск тренда и фильтра объема"""
-    df['swing_high'] = df['high'][(df['high'] == df['high'].rolling(window*2+1, center=True).max())]
-    df['swing_low'] = df['low'][(df['low'] == df['low'].rolling(window*2+1, center=True).min())]
+def prepare_indicators(df):
+    """Расчет структуры, тренда и волатильности (ATR) без заглядывания в будущее"""
+    # EMA для фильтрации глобального направления
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema150'] = df['close'].ewm(span=150, adjust=False).mean()
     
-    df['last_swing_high'] = df['swing_high'].ffill()
-    df['last_swing_low'] = df['swing_low'].ffill()
+    # ATR (14) для расчета адаптивных стопов и импульсов
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift(1)).abs()
+    low_close = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
     
-    df['is_uptrend'] = df['last_swing_high'] > df['last_swing_high'].shift(5)
-    df['is_uptrend'] = df['is_uptrend'].fillna(True)
-    
-    # Скользящая средняя объема для фильтрации ликвидности
-    df['volume_sma'] = df['volume'].rolling(20).mean()
+    # Размер тела свечи
+    df['body'] = (df['close'] - df['open']).abs()
     return df
 
 def backtest_strategy(df, symbol):
-    trades = []
-    initial_capital = 150.0  # Стартовый депозит $150
+    initial_capital = 150.0
     capital = initial_capital
-    risk_per_trade = 0.02    # Риск 2% на сделку
+    risk_per_trade = 0.02  # Риск 2% ($3 на старте)
+    
+    opens = df['open'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+    ema50 = df['ema50'].values
+    ema150 = df['ema150'].values
+    atrs = df['atr'].values
+    bodies = df['body'].values
     
     in_position = False
-    entry_price = 0
-    stop_loss = 0
-    take_profit = 0
-    allocated_risk_amount = 0
+    pos_type = None        # 'LONG' или 'SHORT'
+    entry_price = 0.0
+    stop_loss = 0.0
+    tp1_price = 0.0        # Уровень 1R (фиксация 50% и перенос в БУ)
+    tp2_price = 0.0        # Уровень 2.2R (полный тейк)
+    be_activated = False   # Флаг перевода в безубыток
+    risk_usd = 0.0
     
-    for i in range(25, len(df)):
+    trades = []
+    
+    for i in range(150, len(df)):
         if capital <= 10:
             break
             
-        current_close = df.loc[i, 'close']
-        current_low = df.loc[i, 'low']
-        current_high = df.loc[i, 'high']
-        is_uptrend = df.loc[i, 'is_uptrend']
-        current_volume = df.loc[i, 'volume']
-        avg_volume = df.loc[i, 'volume_sma']
+        curr_open = opens[i]
+        curr_high = highs[i]
+        curr_low = lows[i]
+        curr_close = closes[i]
+        curr_atr = atrs[i]
         
-        if not in_position:
-            # Улучшенный поиск зоны спроса: ищем импульсную свечу за последние 10 баров
-            # Импульс = тело свечи больше среднего диапазона
-            lookback_slice = df.loc[i-10:i-2]
-            body_sizes = (lookback_slice['close'] - lookback_slice['open']).abs()
-            avg_body = body_sizes.mean()
+        if np.isnan(curr_atr) or curr_atr == 0:
+            continue
             
-            # Находим свечу с сильным бычьим импульсом
-            impulse_candles = lookback_slice[body_sizes > avg_body * 1.3]
+        # 1. СОПРОВОЖДЕНИЕ ОТКРЫТОЙ ПОЗИЦИИ
+        if in_position:
+            if pos_type == 'LONG':
+                # Сначала проверяем стоп-лосс (консервативный тест)
+                if curr_low <= stop_loss:
+                    if be_activated:
+                        # Вторая половина закрылась по безубытку, но первая дала +0.5R
+                        capital += risk_usd * 0.55
+                        trades.append('WIN')
+                    else:
+                        # Полный стоп (-1R)
+                        capital -= risk_usd
+                        trades.append('LOSS')
+                    in_position = False
+                    continue
+                
+                # Проверка полного тейк-профита (TP2 = 2.2R)
+                if curr_high >= tp2_price:
+                    # 50% закрыто на 1R (+0.5R) и 50% на 2.2R (+1.1R) = +1.6R чистыми
+                    capital += risk_usd * 1.6
+                    trades.append('WIN')
+                    in_position = False
+                    continue
+                    
+                # Проверка первого тейка (TP1 = 1.0R) -> перенос стопа в безубыток
+                if not be_activated and curr_high >= tp1_price:
+                    be_activated = True
+                    stop_loss = entry_price  # Стоп в безубыток
+                    
+            elif pos_type == 'SHORT':
+                if curr_high >= stop_loss:
+                    if be_activated:
+                        capital += risk_usd * 0.55
+                        trades.append('WIN')
+                    else:
+                        capital -= risk_usd
+                        trades.append('LOSS')
+                    in_position = False
+                    continue
+                    
+                if curr_low <= tp2_price:
+                    capital += risk_usd * 1.6
+                    trades.append('WIN')
+                    in_position = False
+                    continue
+                    
+                if not be_activated and curr_low <= tp1_price:
+                    be_activated = True
+                    stop_loss = entry_price
+                    
+            continue
+
+        # 2. ПОИСК ТОЧКИ ВХОДА (Зона спроса/предложения + подтверждение разворота)
+        # Определяем глобальный тренд
+        uptrend = (curr_close > ema150[i]) and (ema50[i] > ema150[i])
+        downtrend = (curr_close < ema150[i]) and (ema50[i] < ema150[i])
+        
+        # Окно поиска недавней зоны консолидации/импульса (последние 20 свечей)
+        zone_low = np.min(lows[i-20:i-2])
+        zone_high = np.max(highs[i-20:i-2])
+        
+        # --- СЦЕНАРИЙ LONG (Зона спроса + бычий слом/поглощение) ---
+        if uptrend:
+            # Цена недавно спустилась в нижнюю часть диапазона (зону спроса)
+            touched_demand = (curr_low <= zone_low + curr_atr * 0.8) or (lows[i-1] <= zone_low + curr_atr * 0.8)
+            # Подтверждение (Шаг 3): текущая свеча бычья и закрылась выше максимума предыдущей свечи (локальный слом вверх)
+            bullish_confirm = (curr_close > curr_open) and (curr_close > highs[i-1]) and (bodies[i] > curr_atr * 0.25)
             
-            if not impulse_candles.empty:
-                # Берем диапазон последней импульсной зоны спроса
-                zone_low = impulse_candles['low'].min()
-                zone_high = impulse_candles['high'].max()
+            if touched_demand and bullish_confirm:
+                stop_price = min(curr_low, lows[i-1]) - (curr_atr * 0.3)
+                risk_dist = curr_close - stop_price
                 
-                # Условия входа: 
-                # 1. Тренд восходящий
-                # 2. Цена откатила в зону спроса
-                # 3. Объем на текущем баре выше или около среднего (подтверждение интереса)
-                volume_ok = current_volume >= (avg_volume * 0.8)
-                
-                if is_uptrend and current_low <= zone_high and current_low >= zone_low and volume_ok:
+                if risk_dist > 0 and (risk_dist / curr_close) < 0.04:  # Фильтр адекватного стопа (<4%)
                     in_position = True
-                    entry_price = current_close
-                    stop_loss = zone_low * 0.990  # Чуть шире стоп за зону
-                    
-                    risk_distance = entry_price - stop_loss
-                    if risk_distance <= 0:
-                        in_position = False
-                        continue
-                        
-                    take_profit = entry_price + (risk_distance * 2.2) # Чуть выше R:R (1:2.2)
-                    allocated_risk_amount = capital * risk_per_trade
-                    
-        elif in_position:
-            if current_low <= stop_loss:
-                capital -= allocated_risk_amount
-                in_position = False
-                trades.append({'result': 'LOSS'})
-            elif current_high >= take_profit:
-                profit = allocated_risk_amount * 2.2
-                capital += profit
-                in_position = False
-                trades.append({'result': 'WIN'})
+                    pos_type = 'LONG'
+                    entry_price = curr_close
+                    stop_loss = stop_price
+                    tp1_price = entry_price + (risk_dist * 1.0)  # На 1R берем часть и ставим БУ
+                    tp2_price = entry_price + (risk_dist * 2.2)  # Основная цель
+                    be_activated = False
+                    risk_usd = capital * risk_per_trade
+                    continue
+
+        # --- СЦЕНАРИЙ SHORT (Зона предложения + медвежий слом/поглощение) ---
+        if downtrend:
+            # Цена поднялась в верхнюю часть диапазона (зону предложения)
+            touched_supply = (curr_high >= zone_high - curr_atr * 0.8) or (highs[i-1] >= zone_high - curr_atr * 0.8)
+            # Подтверждение: текущая свеча медвежья и пробила минимум предыдущей свечи (локальный слом вниз)
+            bearish_confirm = (curr_close < curr_open) and (curr_close < lows[i-1]) and (bodies[i] > curr_atr * 0.25)
+            
+            if touched_supply and bearish_confirm:
+                stop_price = max(curr_high, highs[i-1]) + (curr_atr * 0.3)
+                risk_dist = stop_price - curr_close
                 
-    wins = len([t for t in trades if t['result'] == 'WIN'])
-    losses = len([t for t in trades if t['result'] == 'LOSS'])
+                if risk_dist > 0 and (risk_dist / curr_close) < 0.04:
+                    in_position = True
+                    pos_type = 'SHORT'
+                    entry_price = curr_close
+                    stop_loss = stop_price
+                    tp1_price = entry_price - (risk_dist * 1.0)
+                    tp2_price = entry_price - (risk_dist * 2.2)
+                    be_activated = False
+                    risk_usd = capital * risk_per_trade
+                    continue
+
+    wins = trades.count('WIN')
+    losses = trades.count('LOSS')
     total = wins + losses
-    winrate = (wins / total * 100) if total > 0 else 0
+    winrate = (wins / total * 100) if total > 0 else 0.0
     net_profit = capital - initial_capital
     
     return {
@@ -117,24 +209,26 @@ def backtest_strategy(df, symbol):
 
 def main():
     exchange = ccxt.bybit()
-    print(f"Запуск продвинутого бэктеста (со структурами импульсов и объемом) для {len(SYMBOLS)} пар...\n")
+    print(f"Запуск бэктеста v4.0 (1h, 60 дней, LONG+SHORT, подтверждение + БУ на 1R)...\n")
     
     results = []
     for symbol in SYMBOLS:
-        df = fetch_historical_data(exchange, symbol, timeframe='4h', limit=400)
-        if df is not None and not df.empty:
-            df = find_market_structure(df)
+        df = fetch_historical_data(exchange, symbol, timeframe='1h', days=60)
+        if df is not None and len(df) > 200:
+            df = prepare_indicators(df)
             res = backtest_strategy(df, symbol)
             results.append(res)
             print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Баланс: ${res['final_capital']:.2f} ({res['profit_usd']:+.2f}$)")
         else:
-            print(f"[{symbol}] Пропущено (нет данных)")
+            print(f"[{symbol}] Пропущено (мало данных)")
+        time.sleep(0.1)
             
     if results:
         df_res = pd.DataFrame(results)
         print("\n" + "="*55)
-        print(" ИТОГОВАЯ СВОДКА (ПРОДВИНУТАЯ СТРАТЕГИЯ) ")
+        print(" ИТОГОВАЯ СВОДКА v4.0 (ПОДТВЕРЖДЕНИЕ + БЕЗУБЫТОК) ")
         print("="*55)
+        print(f"Всего сделок по портфелю: {df_res['trades'].sum()}")
         print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
         print(f"Средний конечный баланс: ${df_res['final_capital'].mean():.2f}")
         print(f"Общий финансовый результат по портфелю: {df_res['profit_usd'].sum():+.2f}$")
