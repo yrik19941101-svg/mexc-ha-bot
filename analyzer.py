@@ -294,4 +294,71 @@ def backtest_strategy(df, symbol):
                 bear_break = (curr_close < curr_open) and (curr_close < lows[i-1]) and (bodies[i] > curr_atr * 0.20)
                 bear_pinbar = (curr_close < curr_open) and ((curr_high - curr_close) / candle_range >= 0.62) and (curr_close < closes[i-1])
                 
-                if rsi_ok and (bear_break or
+                if rsi_ok and (bear_break or bear_pinbar):
+                    stop_price = max(matched_zone['top'], curr_high, highs[i-1]) + (curr_atr * 0.22)
+                    r_dist = stop_price - curr_close
+                    
+                    if (curr_atr * 0.35) <= r_dist <= (curr_atr * 1.45):
+                        in_position = True
+                        pos_type = 'SHORT'
+                        entry_price = curr_close
+                        stop_loss = stop_price
+                        risk_dist = r_dist
+                        be_trigger_price = entry_price - (r_dist * 0.90)
+                        tp1_price = entry_price - (r_dist * 1.40)
+                        tp2_price = entry_price - (r_dist * 2.60)
+                        be_activated = False
+                        tp1_hit = False
+                        risk_usd = capital * risk_per_trade
+                        supply_zones.remove(matched_zone)
+                        continue
+
+    wins = trades.count('WIN')
+    losses = trades.count('LOSS')
+    total = wins + losses
+    winrate = (wins / total * 100) if total > 0 else 0.0
+    net_profit = capital - initial_capital
+    
+    return {
+        'symbol': symbol,
+        'trades': total,
+        'winrate': winrate,
+        'final_capital': capital,
+        'profit_usd': net_profit
+    }
+
+def main():
+    exchange = ccxt.bybit()
+    print(f"Запуск бэктеста v6.0 (BOS + Защитный щит 0.9R + 1.4R/2.6R + Анти-распил)...\n")
+    
+    results = []
+    for symbol in SYMBOLS:
+        df = fetch_historical_data(exchange, symbol, timeframe='1h', days=60)
+        if df is not None and len(df) > 200:
+            df = prepare_indicators(df)
+            res = backtest_strategy(df, symbol)
+            results.append(res)
+            print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Баланс: ${res['final_capital']:.2f} ({res['profit_usd']:+.2f}$)")
+        else:
+            print(f"[{symbol}] Пропущено (мало данных)")
+        time.sleep(0.1)
+            
+    if results:
+        df_res = pd.DataFrame(results)
+        profitable_pairs = len(df_res[df_res['profit_usd'] > 0])
+        print("\n" + "="*60)
+        print(" ИТОГОВАЯ СВОДКА v6.0 (BOS + ЗАЩИТА 0.9R + АНТИ-РАСПИЛ) ")
+        print("="*60)
+        print(f"Всего сделок по портфелю: {df_res['trades'].sum()}")
+        print(f"Плюсовых пар из {len(df_res)}: {profitable_pairs}")
+        print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
+        print(f"Средний конечный баланс: ${df_res['final_capital'].mean():.2f}")
+        print(f"Общий финансовый результат по портфелю: {df_res['profit_usd'].sum():+.2f}$")
+        best = df_res.loc[df_res['profit_usd'].idxmax()]
+        worst = df_res.loc[df_res['profit_usd'].idxmin()]
+        print(f"Лучшая пара: {best['symbol']} ({best['profit_usd']:+.2f}$)")
+        print(f"Худшая пара: {worst['symbol']} ({worst['profit_usd']:+.2f}$)")
+        print("="*60)
+
+if __name__ == "__main__":
+    main()
