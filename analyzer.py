@@ -19,20 +19,25 @@ def fetch_historical_data(exchange, symbol, timeframe='4h', limit=400):
         return None
 
 def find_market_structure(df, window=5):
-    """Поиск локальных экстремумов для определения структуры тренда"""
+    """Поиск локальных экстремумов и определение тренда колоночным методом"""
     df['swing_high'] = df['high'][(df['high'] == df['high'].rolling(window*2+1, center=True).max())]
     df['swing_low'] = df['low'][(df['low'] == df['low'].rolling(window*2+1, center=True).min())]
     
-    # Заполняем пропуски последними известными значениями структуры
+    # Заполняем пропуски последними значениями
     df['last_swing_high'] = df['swing_high'].ffill()
     df['last_swing_low'] = df['swing_low'].ffill()
+    
+    # Векторизованное определение тренда (сравнение колонок целиком)
+    df['is_uptrend'] = df['last_swing_high'] > df['last_swing_high'].shift(5)
+    df['is_uptrend'] = df['is_uptrend'].fillna(True) # Заглушка для первых строк
+    
     return df
 
 def backtest_strategy(df, symbol):
     trades = []
     initial_capital = 150.0  # Стартовый депозит $150
     capital = initial_capital
-    risk_per_trade = 0.02    # Риск 2% от текущего капитала на сделку
+    risk_per_trade = 0.02    # Риск 2% от капитала на сделку
     
     in_position = False
     entry_price = 0
@@ -42,48 +47,41 @@ def backtest_strategy(df, symbol):
     allocated_risk_amount = 0
     
     for i in range(20, len(df)):
-        if capital <= 10:  # Защита от полного слива
+        if capital <= 10:  # Защита от слива
             break
             
         current_close = df.loc[i, 'close']
         current_low = df.loc[i, 'low']
         current_high = df.loc[i, 'high']
-        
-        # Определяем тренд по последним свингам
-        prev_low = df.loc[i-1, 'last_swing_low']
-        prev_high = df.loc[i-1, 'last_swing_high']
-        
-        is_uptrend = prev_high > prev_high.shift(5) if not pd.isna(prev_high) else True
+        is_uptrend = df.loc[i, 'is_uptrend']
         
         if not in_position:
-            # Ищем зону спроса (минимальная точка импульса) только на восходящем тренде
+            # Ищем зону спроса по недавним барам
             zone_low = df.loc[i-8:i-2, 'low'].min()
             zone_high = df.loc[i-8:i-2, 'high'].max()
             
-            # Условие входа: цена вернулась в зону спроса на восходящем тренде
+            # Условие входа: восходящий тренд + цена в зоне спроса
             if is_uptrend and current_low <= zone_high and current_low >= zone_low:
                 in_position = True
                 position_type = 'LONG'
                 entry_price = current_close
-                stop_loss = zone_low * 0.992  # Стоп чуть ниже зоны спроса
+                stop_loss = zone_low * 0.992  # Стоп под зоной
                 
                 risk_distance = entry_price - stop_loss
                 if risk_distance <= 0:
                     in_position = False
                     continue
                     
-                take_profit = entry_price + (risk_distance * 2.0) # Фиксированное R:R 1:2
+                take_profit = entry_price + (risk_distance * 2.0) # R:R 1:2
                 allocated_risk_amount = capital * risk_per_trade
                 
         elif in_position:
             if position_type == 'LONG':
                 if current_low <= stop_loss:
-                    # Убыток: теряем ровно 2% от депозита
                     capital -= allocated_risk_amount
                     in_position = False
                     trades.append({'result': 'LOSS'})
                 elif current_high >= take_profit:
-                    # Прибыль: забираем 2 * риск (R:R 1:2)
                     profit = allocated_risk_amount * 2.0
                     capital += profit
                     in_position = False
