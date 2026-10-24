@@ -5,7 +5,7 @@ import ccxt.async_support as ccxt
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 30           # 30 дней (720 часовых свечей)
 INITIAL_BALANCE_USD = 50.00     # Стартовый депозит: $50.00
-MARGIN_PCT_OF_BALANCE = 0.05    # Безопасные 5% от депозита на сделку (гибридный сложный %)
+MARGIN_PCT_OF_BALANCE = 0.05    # Безопасные 5% от депозита на сделку
 MIN_MARGIN_USD = 0.50           # Минимальный порог маржи
 MAX_MARGIN_USD = 100.0          # Защитный потолок маржи
 ASSUMED_LEVERAGE = 15           # Плечо 15x
@@ -13,11 +13,11 @@ BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit Futures: 0.11% за к�
 MAX_HOLD_HOURS = 48             # Принудительное закрытие через 48 часов
 PAIRS_LIMIT = 50                # Топ-50 пар Bybit для теста
 
-# Новые фильтры отсечения флета:
-MIN_BODY_PCT = 0.60             # Увеличенное тело Heikin Ashi >= 0.60% (только сильные импульсы)
-MAX_WICK_PCT = 0.10             # Строгая обратная тень <= 0.10%
+# Фильтры отсечения флета:
+MIN_BODY_PCT = 0.60             # Тело Heikin Ashi >= 0.60%
+MAX_WICK_PCT = 0.10             # Обратная тень <= 0.10%
 ATR_PERIOD = 14                 # Период расчета волатильности
-ATR_MULTIPLIER = 1.2            # Текущая свеча должна быть больше ATR * 1.2 (фильтр всплеска активности)
+ATR_MULTIPLIER = 1.2            # Фильтр всплеска активности
 
 PROFILES_TO_TEST = [
     {"id": 1, "tp": 0.80, "sl": 0.60, "use_lock": False, "name": "Оптимизированный Профиль #1 (TP +80% / без БУ)"},
@@ -152,13 +152,12 @@ async def run_optimized_backtest():
             if curr_c["body_pct"] < MIN_BODY_PCT:
                 continue
 
-            # Фильтр волатильности ATR: свеча должна быть активной
             if curr_c["true_range"] < (atr_values[idx] * ATR_MULTIPLIER):
                 continue
 
             current_price = curr_c["real_close"]
             ema_now = ema_values[idx]
-            ema_prev = ema_values[idx - 5]  жжесткий фильтр наклона EMA за 5 часов
+            ema_prev = ema_values[idx - 5]
 
             target_dir = None
             if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
