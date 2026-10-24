@@ -2,14 +2,14 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== НАСТРОЙКИ ГЛУБОКОЙ ЛАБОРАТОРИИ ====================
+# ==================== РАСШИРЕННЫЕ НАСТРОЙКИ ЛАБОРАТОРИИ ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 60           # Глубина истории: 60 дней стресс-теста
 INITIAL_BALANCE_USD = 100.00    # Стартовый депозит: $100.00
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit (0.11% за круг)
-MAX_HOLD_HOURS = 36             # Максимальное удержание сделки
-PAIRS_LIMIT = 35                # Топ-35 пар Bybit для максимального охвата рынка
-# ========================================================================
+MAX_HOLD_HOURS = 48             # Максимальное удержание сделки
+PAIRS_LIMIT = 35                # Топ-35 пар Bybit
+# ============================================================================
 
 
 def calculate_deep_indicators(ohlcv):
@@ -28,7 +28,6 @@ def calculate_deep_indicators(ohlcv):
     ema50 = ema(closes, 50)
     ema200 = ema(closes, 200)
 
-    # RSI (14)
     rsi = [50.0] * len(closes)
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -69,7 +68,6 @@ def calculate_deep_indicators(ohlcv):
 
 
 def simulate_strategy(strategy, market_data):
-    """Симулирует торговлю со сложным процентом (1% ставка) по конкретному набору параметров."""
     sim_balance = INITIAL_BALANCE_USD
     wins, losses = 0, 0
     peak = INITIAL_BALANCE_USD
@@ -90,10 +88,8 @@ def simulate_strategy(strategy, market_data):
 
             prev_c, curr_c = bars[i - 1], bars[i]
             price = curr_c["real_close"]
-
             direction = None
 
-            # Варианты логики входа в рынок
             if entry_logic == "ha_trend_pullback":
                 if prev_c["color"] != curr_c["color"] and curr_c["body_pct"] >= min_body:
                     is_bull = price > curr_c["ema200"]
@@ -102,14 +98,6 @@ def simulate_strategy(strategy, market_data):
                         direction = "LONG"
                     elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED" and is_bear and curr_c["upper_wick_pct"] <= max_wick:
                         direction = "SHORT"
-
-            elif entry_logic == "rsi_ema_crossover":
-                is_bull_trend = price > curr_c["ema50"] and curr_c["ema50"] > curr_c["ema200"]
-                is_bear_trend = price < curr_c["ema50"] and curr_c["ema50"] < curr_c["ema200"]
-                if is_bull_trend and curr_c["rsi"] < 40 and prev_c["rsi"] >= 40:
-                    direction = "LONG"
-                elif is_bear_trend and curr_c["rsi"] > 60 and prev_c["rsi"] <= 60:
-                    direction = "SHORT"
 
             elif entry_logic == "ha_pure_momentum":
                 if curr_c["body_pct"] >= min_body and curr_c["upper_wick_pct"] <= max_wick and curr_c["lower_wick_pct"] <= max_wick:
@@ -121,7 +109,6 @@ def simulate_strategy(strategy, market_data):
             if not direction:
                 continue
 
-            # СЛОЖНЫЙ ПРОЦЕНТ: Ставка ровно 1% от текущего баланса
             margin = max(0.50, round(sim_balance * 0.01, 2))
             if sim_balance < margin:
                 break
@@ -206,7 +193,7 @@ def simulate_strategy(strategy, market_data):
 
 
 async def main():
-    print(f"🧬 [ГЛУБИННАЯ ЛАБОРАТОРИЯ]: Запуск марафонского перебора тысяч вариантов...", flush=True)
+    print(f"🚀 [МЕГА-ЛАБОРАТОРИЯ]: Запуск расширенного марафона (TP до 5.0x)...", flush=True)
     exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "linear"}})
 
     markets = await exchange.load_markets(True)
@@ -230,17 +217,16 @@ async def main():
     await exchange.close()
     print(f"💾 Закешировано пар: {len(market_data)}.", flush=True)
 
-    # Генерация матрицы параметров для тысяч комбинаций
-    logic_grid = ["ha_trend_pullback", "rsi_ema_crossover", "ha_pure_momentum"]
-    tp_grid = [2.0, 2.5, 3.0, 3.5, 4.0]
-    sl_grid = [1.0, 1.25, 1.5]
-    leverage_grid = [5, 10, 15, 20]
-    min_body_grid = [0.25, 0.35, 0.50]
-    max_wick_grid = [0.10, 0.15, 0.25]
+    # Расширенная сетка параметров
+    logic_grid = ["ha_trend_pullback", "ha_pure_momentum"]
+    tp_grid = [2.5, 3.0, 3.5, 4.0, 4.5, 5.0]       # Тейки до 5.0x
+    sl_grid = [1.0, 1.25, 1.5, 2.0]               # Стопы
+    leverage_grid = [5, 10, 15, 20]               # Плечи
+    min_body_grid = [0.20, 0.35, 0.50]            # Тело HA
+    max_wick_grid = [0.10, 0.20, 0.30]            # Тень HA
 
     all_combinations = list(product(logic_grid, tp_grid, sl_grid, leverage_grid, min_body_grid, max_wick_grid))
-    print(f"🧬 Сгенерировано уникальных вариантов стратегий для тестирования: {len(all_combinations)}\n", flush=True)
-    print("⏳ Идет марафонский перебор и стресс-тест. Ожидайте результаты...", flush=True)
+    print(f"🧬 Сгенерировано комбинаций для мега-теста: {len(all_combinations)}\n", flush=True)
 
     results = []
     for idx, (logic, tp, sl, lev, min_b, max_w) in enumerate(all_combinations, 1):
@@ -250,14 +236,13 @@ async def main():
         res = simulate_strategy(strat, market_data)
         if res:
             results.append(res)
-            # Выводим только те, что показали плюс
             if res["profit"] > 0:
                 print(f"[{idx}/{len(all_combinations)}] ✅ ПЛЮС! {logic} | Плечо:{lev}x | TP:{tp}x/SL:{sl}x | Баланс: ${res['balance']:.2f} (Прибыль: ${res['profit']:+.2f})", flush=True)
 
     results.sort(key=lambda x: x["profit"], reverse=True)
 
     print("\n" + "="*125, flush=True)
-    print("🏆 ТОП-3 АБСОЛЮТНЫХ ПОБЕДИТЕЛЯ ПО ИТОГАМ ТЫСЯЧ ТЕСТОВ:", flush=True)
+    print("🏆 ТОП-3 АБСОЛЮТНЫХ ПОБЕДИТЕЛЯ МЕГА-ЛАБОРАТОРИИ:", flush=True)
     print("="*125, flush=True)
     for i, r in enumerate(results[:3], 1):
         s = r["strategy"]
