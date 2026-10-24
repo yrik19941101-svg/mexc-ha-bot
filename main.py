@@ -2,20 +2,20 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== НАСТРОЙКИ СТРЕСС-ТЕСТА НА 60 ДНЕЙ ====================
+# ==================== НАСТРОЙКИ ГИБРИДНОГО ТЕСТА ====================
 TIMEFRAME = "1h"
-DAYS_TO_BACKTEST = 60           # Увеличено до 60 дней истории (около 1440 свечей)
+DAYS_TO_BACKTEST = 60           # 60 дней глубокой истории
 INITIAL_BALANCE_USD = 100.00    # Стартовый депозит: $100.00
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit (0.11% за круг)
-MAX_HOLD_HOURS = 36             # Максимальное удержание позиции
+MAX_HOLD_HOURS = 36             # Таймаут сделки
 PAIRS_LIMIT = 30                # Топ-30 пар Bybit
-# ============================================================================
+LEVERAGE = 10                   # Плечо 10x
+# ====================================================================
 
 
-def calculate_indicators(ohlcv):
+def calculate_hybrid_data(ohlcv):
+    ha_candles = []
     closes = [c[4] for c in ohlcv]
-    highs = [c[2] for c in ohlcv]
-    lows = [c[3] for c in ohlcv]
     
     def ema(series, period):
         if len(series) < period:
@@ -28,99 +28,107 @@ def calculate_indicators(ohlcv):
 
     ema200 = ema(closes, 200)
 
-    # RSI (14)
-    rsi = [50.0] * len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        chg = closes[i] - closes[i - 1]
-        gains.append(chg if chg > 0 else 0)
-        losses.append(-chg if chg < 0 else 0)
-        if i >= 14:
-            ag = sum(gains[-14:]) / 14
-            al = sum(losses[-14:]) / 14
-            rsi[i] = 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + (ag / al)))
-
-    # Bollinger Bands (20, 2)
-    bb_upper, bb_lower = [], []
-    for i in range(len(closes)):
-        if i < 20:
-            bb_upper.append(closes[i] * 1.02)
-            bb_lower.append(closes[i] * 0.98)
+    for i, candle in enumerate(ohlcv):
+        ts, o, h, l, c, v = candle
+        ha_close = (o + h + l + c) / 4.0
+        if i == 0:
+            ha_open = (o + c) / 2.0
         else:
-            win = closes[i - 19:i + 1]
-            mean = sum(win) / 20
-            stdev = (sum((x - mean) ** 2 for x in win) / 20) ** 0.5
-            bb_upper.append(mean + (2 * stdev))
-            bb_lower.append(mean - (2 * stdev))
+            ha_open = (ha_candles[i - 1]["ha_open"] + ha_candles[i - 1]["ha_close"]) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
 
-    indicators = []
-    for i in range(len(closes)):
-        indicators.append({
-            "timestamp": ohlcv[i][0],
-            "close": closes[i],
-            "high": highs[i],
-            "low": lows[i],
-            "ema200": ema200[i],
-            "rsi": rsi[i],
-            "bb_upper": bb_upper[i],
-            "bb_lower": bb_lower[i]
+        body_pct = abs(ha_close - ha_open) / ha_open * 100.0 if ha_open > 0 else 0.0
+        color = "GREEN" if ha_close > ha_open else "RED"
+        upper_wick_pct = (ha_high - max(ha_open, ha_close)) / ha_open * 100.0 if ha_open > 0 else 0.0
+        lower_wick_pct = (min(ha_open, ha_close) - ha_low) / ha_open * 100.0 if ha_open > 0 else 0.0
+
+        ha_candles.append({
+            "timestamp": ts,
+            "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low, "ha_close": ha_close,
+            "real_open": o, "real_high": h, "real_low": l, "real_close": c,
+            "body_pct": body_pct, "color": color,
+            "upper_wick_pct": upper_wick_pct, "lower_wick_pct": lower_wick_pct,
+            "ema200": ema200[i]
         })
-    return indicators
+    return ha_candles
 
 
-def evaluate_strategy(strategy, market_data):
+async def run_hybrid_stress_test():
+    print(f"🧬 Запуск ГИБРИДНОГО стресс-теста на 60 дней (HA снайпер + TP 4.0x + Сложн. %)...", flush=True)
+    exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "linear"}})
+
+    markets = await exchange.load_markets(True)
+    all_swaps = [
+        sym for sym, m in markets.items()
+        if m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active", True)
+    ][:PAIRS_LIMIT]
+
+    print(f"📊 Загружаем историю за 60 дней по {len(all_swaps)} парам Bybit...", flush=True)
+    since_ts = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
+    market_data = {}
+
+    for sym in all_swaps:
+        try:
+            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_ts, limit=1500)
+            if ohlcv and len(ohlcv) > 500:
+                market_data[sym] = calculate_hybrid_data(ohlcv)
+        except Exception:
+            pass
+
+    await exchange.close()
+    print(f"💾 Закешировано пар: {len(market_data)}. Запускаем симуляцию...\n", flush=True)
+
     sim_balance = INITIAL_BALANCE_USD
     wins, losses = 0, 0
     peak = INITIAL_BALANCE_USD
     max_dd = 0.0
+    pair_busy = {}
+    trade_log = []
 
-    entry_rule = strategy["entry"]
-    tp_mult = strategy["tp"]
-    sl_mult = strategy["sl"]
-    leverage = strategy["leverage"]
-
-    for sym, bars in market_data.items():
-        pair_busy = -1
-        for i in range(200, len(bars) - MAX_HOLD_HOURS):
-            if i <= pair_busy:
+    for sym, ha_bars in market_data.items():
+        for i in range(200, len(ha_bars) - MAX_HOLD_HOURS):
+            if i <= pair_busy.get(sym, -1):
                 continue
 
-            bar = bars[i]
-            prev = bars[i - 1]
-            price = bar["close"]
+            prev_c = ha_bars[i - 1]
+            curr_c = ha_bars[i]
+
+            # Фильтр тела и цвета Heikin Ashi
+            if prev_c["color"] == curr_c["color"]:
+                continue
+            if curr_c["body_pct"] < 0.35:
+                continue
+
+            price = curr_c["real_close"]
+            is_bullish_trend = price > curr_c["ema200"]
+            is_bearish_trend = price < curr_c["ema200"]
+
             direction = None
-
-            is_bullish_trend = price > bar["ema200"]
-            is_bearish_trend = price < bar["ema200"]
-
-            if entry_rule == "rsi_trend_pullback":
-                if is_bullish_trend and bar["rsi"] < 40 and prev["rsi"] >= 40:
+            if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
+                if is_bullish_trend and curr_c["lower_wick_pct"] <= 0.15:
                     direction = "LONG"
-                elif is_bearish_trend and bar["rsi"] > 60 and prev["rsi"] <= 60:
-                    direction = "SHORT"
-            elif entry_rule == "bb_trend_breakout":
-                if is_bullish_trend and bar["close"] > bar["bb_upper"] and prev["close"] <= prev["bb_upper"]:
-                    direction = "LONG"
-                elif is_bearish_trend and bar["close"] < bar["bb_lower"] and prev["close"] >= prev["bb_lower"]:
+            elif prev_c["color"] == "GREEN" and curr_c["color"] == "RED":
+                if is_bearish_trend and curr_c["upper_wick_pct"] <= 0.15:
                     direction = "SHORT"
 
             if not direction:
                 continue
 
-            # Сложный процент: маржа строго 1% от текущего баланса
+            # Сложный процент: 1% от текущего баланса
             margin = max(0.50, round(sim_balance * 0.01, 2))
             if sim_balance < margin:
                 break
 
-            pos_size = margin * leverage
+            pos_size = margin * LEVERAGE
             fee = pos_size * BYBIT_FEE_RATE
 
-            atr_proxy = bar["high"] - bar["low"]
+            atr_proxy = curr_c["real_high"] - curr_c["real_low"]
             if atr_proxy <= 0:
                 continue
 
-            sl_dist = atr_proxy * sl_mult
-            tp_dist = atr_proxy * tp_mult
+            sl_dist = atr_proxy * 1.0  # SL = 1x ATR
+            tp_dist = atr_proxy * 4.0  # TP = 4x ATR
 
             if direction == "LONG":
                 entry_p = price
@@ -135,11 +143,11 @@ def evaluate_strategy(strategy, market_data):
             exit_off = MAX_HOLD_HOURS
 
             for offset in range(1, MAX_HOLD_HOURS + 1):
-                if i + offset >= len(bars):
+                if i + offset >= len(ha_bars):
                     break
-                fb = bars[i + offset]
-                hit_tp = (fb["high"] >= tp_p) if direction == "LONG" else (fb["low"] <= tp_p)
-                hit_sl = (fb["low"] <= sl_p) if direction == "LONG" else (fb["high"] >= sl_p)
+                fb = ha_bars[i + offset]
+                hit_tp = (fb["real_high"] >= tp_p) if direction == "LONG" else (fb["real_low"] <= tp_p)
+                hit_sl = (fb["real_low"] <= sl_p) if direction == "LONG" else (fb["real_high"] >= sl_p)
 
                 if hit_sl:
                     gross_pnl = - (sl_dist / entry_p) * pos_size
@@ -151,11 +159,11 @@ def evaluate_strategy(strategy, market_data):
                     break
 
             if gross_pnl is None:
-                last_c = bars[i + MAX_HOLD_HOURS]["close"]
+                last_c = ha_bars[i + MAX_HOLD_HOURS]["real_close"]
                 chg = (last_c - entry_p) / entry_p if direction == "LONG" else (entry_p - last_c) / entry_p
                 gross_pnl = chg * pos_size
 
-            pair_busy = i + exit_off
+            pair_busy[sym] = i + exit_off
             net_pnl = gross_pnl - fee
             sim_balance += net_pnl
 
@@ -175,81 +183,19 @@ def evaluate_strategy(strategy, market_data):
                 losses += 1
 
     total_trades = wins + losses
-    if total_trades < 15:
-        return None
-
-    winrate = (wins / total_trades) * 100.0
+    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
     profit = sim_balance - INITIAL_BALANCE_USD
 
-    return {
-        "strategy": strategy,
-        "balance": sim_balance,
-        "profit": profit,
-        "winrate": winrate,
-        "trades": total_trades,
-        "dd": max_dd
-    }
-
-
-async def run_stress_test():
-    print(f"🚀 Запуск СТРЕСС-ТЕСТА на 60 дней (Плечо до 20x, TP до 5.0x)...", flush=True)
-    exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "linear"}})
-
-    markets = await exchange.load_markets(True)
-    all_swaps = [
-        sym for sym, m in markets.items()
-        if m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active", True)
-    ][:PAIRS_LIMIT]
-
-    print(f"📊 Загружаем историю за 60 дней по {len(all_swaps)} парам Bybit...", flush=True)
-    since_ts = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
-    market_data = {}
-
-    for sym in all_swaps:
-        try:
-            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_ts, limit=1500)
-            if ohlcv and len(ohlcv) > 500:
-                market_data[sym] = calculate_indicators(ohlcv)
-        except Exception:
-            pass
-
-    await exchange.close()
-    print(f"💾 Закешировано пар: {len(market_data)}. Запускаем тест на 60 дней...\n", flush=True)
-
-    rules = ["rsi_trend_pullback", "bb_trend_breakout"]
-    tp_grid = [3.0, 4.0, 5.0]
-    sl_grid = [1.0]
-    leverage_grid = [10, 15, 20]
-
-    strategies = [{"entry": r, "tp": tp, "sl": sl, "leverage": lev} for r, tp, sl, lev in product(rules, tp_grid, sl_grid, leverage_grid)]
-    print(f"🧬 Всего вариантов для 60-дневного стресс-теста: {len(strategies)}\n", flush=True)
-
-    results = []
-    for idx, strat in enumerate(strategies, 1):
-        res = evaluate_strategy(strat, market_data)
-        if res:
-            results.append(res)
-            print(f"[{idx}/{len(strategies)}] ✅ {strat['entry']} (Плечо:{strat['leverage']}x, TP:{strat['tp']}x) -> Баланс: ${res['balance']:.2f} | Прибыль: ${res['profit']:+.2f}", flush=True)
-        else:
-            print(f"[{idx}/{len(strategies)}] ❌ Мало сделок / слив", flush=True)
-
-    results.sort(key=lambda x: x["profit"], reverse=True)
-
-    print("\n" + "="*115, flush=True)
-    print("🏆 ТОП-3 ЛУЧШИЕ СТРАТЕГИИ ПО ИТОГАМ 60 ДНЕЙ СТРЕСС-ТЕСТА:", flush=True)
-    print("="*115, flush=True)
-    for i, r in enumerate(results[:3], 1):
-        s = r["strategy"]
-        print(
-            f"#{i} | Логика: {s['entry']:<20} | Плечо: {s['leverage']:>2}x | TP: {s['tp']}x | SL: {s['sl']}x | "
-            f"Итог: <b>${r['balance']:>6.2f}</b> (Прибыль: <b>${r['profit']:>+6.2f}</b>) | "
-            f"Винрейт: {r['winrate']:>5.1f}% | Сделок: {r['trades']:>3} | Просадка: {r['dd']:>5.1f}%",
-            flush=True
-        )
-    print("="*115, flush=True)
+    print("="*105, flush=True)
+    print("🏆 РЕЗУЛЬТАТЫ ГИБРИДНОГО СТРЕСС-ТЕСТА НА 60 ДНЕЙ:", flush=True)
+    print("="*105, flush=True)
+    print(f"• Итоговый баланс: <b>${sim_balance:.2f}</b> (Чистая прибыль: <b>${profit:+.2f}</b>)")
+    print(f"• Винрейт: {winrate:.1f}% (Побед: {wins} / Поражений: {losses} из {total_trades} сделок)")
+    print(f"• Максимальная просадка: <b>{max_dd:.1f}%</b>")
+    print("="*105, flush=True)
 
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(run_stress_test())
+    asyncio.run(run_hybrid_stress_test())
