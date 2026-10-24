@@ -2,118 +2,115 @@ import ccxt
 import pandas as pd
 import numpy as np
 
-def run_backtest():
-    print("Загрузка данных для бэктеста за 60 дней (1440 часов)...")
-    exchange = ccxt.binance({'options': {'defaultType': 'future'}})
-    exchange.load_markets()
-    
-    # Берем топ-15 самых ликвидных монет для ускорения симуляции
-    tickers = exchange.fetch_tickers()
-    futures_tickers = {s: d for s, d in tickers.items() if 'USDT' in s and d.get('quoteVolume')}
-    sorted_coins = sorted(futures_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)
-    top_coins = [item[0] for item in sorted_coins[:15]]
-    
-    initial_deposit = 100.0
-    balance = initial_deposit
-    leverage = 20
-    total_trades = 0
-    winning_trades = 0
-    losing_trades = 0
-    
-    print(f"Стартовый депозит: ${balance} | Плечо: {leverage}x | Риск-профиль: TP +6%, SL -3%\n")
-    
-    history_trades = []
+# Список из 20 ликвидных пар на Bybit
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
+    'AVAX/USDT', 'DOGE/USDT', 'LINK/USDT', 'DOT/USDT', 'NEAR/USDT',
+    'APT/USDT', 'ARB/USDT', 'OP/USDT', 'SUI/USDT', 'INJ/USDT',
+    'FIL/USDT', 'RENDER/USDT', 'ATOM/USDT', 'LTC/USDT', 'TIA/USDT'
+]
 
-    for symbol in top_coins:
-        try:
-            # Загружаем 1440 часовых свечей (60 дней)
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=1440)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+def fetch_historical_data(exchange, symbol, timeframe='4h', limit=400):
+    """Загрузка исторических данных с Bybit"""
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        print(f"Ошибка загрузки {symbol}: {e}")
+        return None
+
+def backtest_strategy(df, symbol):
+    """Логика бэктеста стратегии (структура + зоны спроса) для конкретной пары"""
+    trades = []
+    initial_capital = 1000.0
+    capital = initial_capital
+    risk_per_trade = 0.02 # Риск 2% на сделку
+    
+    in_position = False
+    entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    position_type = None
+    
+    for i in range(10, len(df)):
+        current_close = df.loc[i, 'close']
+        current_low = df.loc[i, 'low']
+        current_high = df.loc[i, 'high']
+        
+        if not in_position:
+            # Ищем зону спроса (минимальные цены за последние 5 баров)
+            recent_low = df.loc[i-5:i-1, 'low'].min()
+            recent_high = df.loc[i-5:i-1, 'high'].max()
             
-            # Индикаторы
-            df['ema20'] = df['close'].ewm(span=20).mean()
-            df['sma20'] = df['close'].rolling(window=20).mean()
-            df['std20'] = df['close'].rolling(window=20).std()
-            df['upper_band'] = df['sma20'] + (df['std20'] * 2)
-            df['lower_band'] = df['sma20'] - (df['std20'] * 2)
-            
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            df['rsi'] = 100 - (100 / (1 + rs))
-            
-            df['vol_ma20'] = df['volume'].rolling(window=20).mean()
-            df['volume_spike'] = df['volume'] > (df['vol_ma20'] * 2.0)
-            
-            df = df.dropna().reset_index(drop=True)
-            
-            # Прогон стратегии по истории свеча за свечой
-            in_position = False
-            entry_price = 0
-            tp_price = 0
-            sl_price = 0
-            margin_amount = 0
-            
-            for i in range(1, len(df)):
-                prev = df.iloc[i-1]
-                curr = df.iloc[i]
+            # Условие входа в Лонг при откате к зоне спроса
+            if current_low <= recent_low * 1.002:
+                in_position = True
+                position_type = 'LONG'
+                entry_price = current_close
+                stop_loss = recent_low * 0.993 # Стоп за зону с запасом
+                risk = entry_price - stop_loss
+                if risk <= 0:
+                    in_position = False
+                    continue
+                take_profit = entry_price + (risk * 2.5) # R:R 1:2.5
                 
-                # Если уже в сделке — проверяем, сработал ли Тейк-профит или Стоп-лосс на текущей свече
-                if in_position:
-                    # Проверяем максимум и минимум свечи для выхода
-                    if curr['high'] >= tp_price:
-                        # Сработал Тейк-профит (+6% движения цены * 20 плечо = +120% к марже)
-                        profit = margin_amount * 1.20
-                        balance += profit
-                        winning_trades += 1
-                        total_trades += 1
-                        in_position = False
-                        history_trades.append(('WIN', profit))
-                    elif curr['low'] <= sl_price:
-                        # Сработал Стоп-лосс (-3% движения цены * 20 плечо = -60% к марже)
-                        loss = margin_amount * 0.60
-                        balance -= loss
-                        losing_trades += 1
-                        total_trades += 1
-                        in_position = False
-                        history_trades.append(('LOSS', -loss))
-                
-                # Ищем новый сигнал на вход, если не в позиции
-                if not in_position and balance > 5: # Если есть деньги на балансе
-                    is_breakout = (prev['close'] <= prev['upper_band']) and (curr['close'] > curr['upper_band'])
+        elif in_position:
+            if position_type == 'LONG':
+                if current_low <= stop_loss:
+                    capital -= capital * risk_per_trade
+                    in_position = False
+                    trades.append({'result': 'LOSS'})
+                elif current_high >= take_profit:
+                    capital += capital * risk_per_trade * 2.5
+                    in_position = False
+                    trades.append({'result': 'WIN'})
                     
-                    if is_breakout and curr['volume_spike'] and (55 < curr['rsi'] < 75):
-                        in_position = True
-                        entry_price = curr['close']
-                        tp_price = entry_price * 1.06
-                        sl_price = entry_price * 0.97
-                        
-                        # Сложный процент: маржа равна 1% от текущего баланса (минимум 1$)
-                        margin_amount = max(1.0, balance * 0.01)
-                        
-        except Exception as e:
-            print(f"Ошибка при бэктесте {symbol}: {e}")
+    wins = len([t for t in trades if t['result'] == 'WIN'])
+    losses = len([t for t in trades if t['result'] == 'LOSS'])
+    total = wins + losses
+    winrate = (wins / total * 100) if total > 0 else 0
+    net_profit_pct = ((capital - initial_capital) / initial_capital) * 100
+    
+    return {
+        'symbol': symbol,
+        'trades': total,
+        'wins': wins,
+        'losses': losses,
+        'winrate': winrate,
+        'profit_pct': net_profit_pct
+    }
+
+def main():
+    exchange = ccxt.bybit()
+    print(f"Запуск бэктеста для {len(SYMBOLS)} пар за ~60 дней (таймфрейм 4h)...\n")
+    
+    results = []
+    
+    for symbol in SYMBOLS:
+        df = fetch_historical_data(exchange, symbol, timeframe='4h', limit=400)
+        if df is not None and not df.empty:
+            res = backtest_strategy(df, symbol)
+            results.append(res)
+            print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Доходность: {res['profit_pct']:+.2f}%")
+        else:
+            print(f"[{symbol}] Пропущено (нет данных)")
             
-    # Итоги бэктеста
-    print("\n==============================================")
-    print("          ИТОГИ БЭКТЕСТА ЗА 60 ДНЕЙ           ")
-    print("==============================================")
-    print(f"Начальный депозит:  ${initial_deposit:.2f}")
-    print(f"Итоговый баланс:    ${balance:.2f}")
-    
-    net_profit = balance - initial_deposit
-    roi_total = (net_profit / initial_deposit) * 100
-    print(f"Чистая прибыль:     ${net_profit:.2f}")
-    print(f"Общий ROI стратегии: {roi_total:.2f}%")
-    print(f"Всего сделок:       {total_trades}")
-    
-    if total_trades > 0:
-        win_rate = (winning_trades / total_trades) * 100
-        print(f"Успешных сделок (WinRate): {win_rate:.1f}% ({winning_trades} побед / {losing_trades} поражений)")
-    else:
-        print("За выбранный период по жестким критериям фильтра не было открыто сделок (рынок был во флэте/падении).")
-    print("==============================================")
+    # Общая сводка
+    if results:
+        df_res = pd.DataFrame(results)
+        print("\n" + "="*45)
+        print(" ИТОГОВАЯ СВОДКА ПО ВСЕМ ПАРАМ ")
+        print("="*45)
+        print(f"Всего протестировано пар: {len(df_res)}")
+        print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
+        print(f"Средняя доходность пассивного портфеля: {df_res['profit_pct'].mean():+.2f}%")
+        best_pair = df_res.loc[df_res['profit_pct'].idxmax()]
+        worst_pair = df_res.loc[df_res['profit_pct'].idxmin()]
+        print(f"Лучшая пара: {best_pair['symbol']} ({best_pair['profit_pct']:+.2f}%)")
+        print(f"Худшая пара: {worst_pair['symbol']} ({worst_pair['profit_pct']:+.2f}%)")
+        print("="*45)
 
 if __name__ == "__main__":
-    run_backtest()
+    main()
