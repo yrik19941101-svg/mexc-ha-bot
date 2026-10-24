@@ -18,70 +18,76 @@ def fetch_historical_data(exchange, symbol, timeframe='4h', limit=400):
     except Exception as e:
         return None
 
+def find_market_structure(df, window=5):
+    """Поиск локальных экстремумов для определения структуры тренда"""
+    df['swing_high'] = df['high'][(df['high'] == df['high'].rolling(window*2+1, center=True).max())]
+    df['swing_low'] = df['low'][(df['low'] == df['low'].rolling(window*2+1, center=True).min())]
+    
+    # Заполняем пропуски последними известными значениями структуры
+    df['last_swing_high'] = df['swing_high'].ffill()
+    df['last_swing_low'] = df['swing_low'].ffill()
+    return df
+
 def backtest_strategy(df, symbol):
     trades = []
-    initial_capital = 150.0  # Депозит $150
+    initial_capital = 150.0  # Стартовый депозит $150
     capital = initial_capital
-    
-    base_stake = 0.5         # Первоначальная сделка $0.5
-    max_steps = 4            # Мартингейл на 4 шага
-    current_step = 1
+    risk_per_trade = 0.02    # Риск 2% от текущего капитала на сделку
     
     in_position = False
     entry_price = 0
     stop_loss = 0
     take_profit = 0
     position_type = None
-    current_stake = 0
+    allocated_risk_amount = 0
     
-    for i in range(10, len(df)):
-        if capital <= 0:
-            break  # Если депозит полностью слит
+    for i in range(20, len(df)):
+        if capital <= 10:  # Защита от полного слива
+            break
             
         current_close = df.loc[i, 'close']
         current_low = df.loc[i, 'low']
         current_high = df.loc[i, 'high']
         
+        # Определяем тренд по последним свингам
+        prev_low = df.loc[i-1, 'last_swing_low']
+        prev_high = df.loc[i-1, 'last_swing_high']
+        
+        is_uptrend = prev_high > prev_high.shift(5) if not pd.isna(prev_high) else True
+        
         if not in_position:
-            recent_low = df.loc[i-5:i-1, 'low'].min()
+            # Ищем зону спроса (минимальная точка импульса) только на восходящем тренде
+            zone_low = df.loc[i-8:i-2, 'low'].min()
+            zone_high = df.loc[i-8:i-2, 'high'].max()
             
-            # Условие входа в Лонг
-            if current_low <= recent_low * 1.002:
+            # Условие входа: цена вернулась в зону спроса на восходящем тренде
+            if is_uptrend and current_low <= zone_high and current_low >= zone_low:
                 in_position = True
                 position_type = 'LONG'
                 entry_price = current_close
-                stop_loss = recent_low * 0.993
+                stop_loss = zone_low * 0.992  # Стоп чуть ниже зоны спроса
+                
                 risk_distance = entry_price - stop_loss
                 if risk_distance <= 0:
                     in_position = False
                     continue
-                take_profit = entry_price + (risk_distance * 2.5) # R:R 1:2.5
-                
-                # Рассчитываем размер ставки по шагам мартингейла (0.5 -> 1.0 -> 2.0 -> 4.0)
-                current_stake = base_stake * (2 ** (current_step - 1))
+                    
+                take_profit = entry_price + (risk_distance * 2.0) # Фиксированное R:R 1:2
+                allocated_risk_amount = capital * risk_per_trade
                 
         elif in_position:
             if position_type == 'LONG':
                 if current_low <= stop_loss:
-                    # Убыток: вычитаем текущую ставку из капитала
-                    capital -= current_stake
+                    # Убыток: теряем ровно 2% от депозита
+                    capital -= allocated_risk_amount
                     in_position = False
-                    trades.append({'result': 'LOSS', 'step': current_step})
-                    
-                    # Увеличиваем шаг мартингейла
-                    current_step += 1
-                    if current_step > max_steps:
-                        current_step = 1 # Сброс после 4 шагов
-                        
+                    trades.append({'result': 'LOSS'})
                 elif current_high >= take_profit:
-                    # Прибыль: при R:R 1:2.5 получаем ставку * 2.5
-                    profit = current_stake * 2.5
+                    # Прибыль: забираем 2 * риск (R:R 1:2)
+                    profit = allocated_risk_amount * 2.0
                     capital += profit
                     in_position = False
-                    trades.append({'result': 'WIN', 'step': current_step})
-                    
-                    # Сброс мартингейла при победе
-                    current_step = 1
+                    trades.append({'result': 'WIN'})
                     
     wins = len([t for t in trades if t['result'] == 'WIN'])
     losses = len([t for t in trades if t['result'] == 'LOSS'])
@@ -99,12 +105,13 @@ def backtest_strategy(df, symbol):
 
 def main():
     exchange = ccxt.bybit()
-    print(f"Запуск бэктеста с Мартингейлом (4 шага, старт $150) для {len(SYMBOLS)} пар...\n")
+    print(f"Запуск доработанного бэктеста (фикс. риск 2%, без мартингейла) для {len(SYMBOLS)} пар...\n")
     
     results = []
     for symbol in SYMBOLS:
         df = fetch_historical_data(exchange, symbol, timeframe='4h', limit=400)
         if df is not None and not df.empty:
+            df = find_market_structure(df)
             res = backtest_strategy(df, symbol)
             results.append(res)
             print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Баланс: ${res['final_capital']:.2f} ({res['profit_usd']:+.2f}$)")
@@ -114,9 +121,9 @@ def main():
     if results:
         df_res = pd.DataFrame(results)
         print("\n" + "="*50)
-        print(" ИТОГОВАЯ СВОДКА (МАРТИНГЕЙЛ) ")
+        print(" ИТОГОВАЯ СВОДКА (ДОРАБОТАННАЯ СТРАТЕГИЯ) ")
         print("="*50)
-        print(f"Средний винрейт: {df_res['winrate'].mean():.2f}%")
+        print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
         print(f"Средний конечный баланс: ${df_res['final_capital'].mean():.2f}")
         print(f"Общий финансовый результат по портфелю: {df_res['profit_usd'].sum():+.2f}$")
         best = df_res.loc[df_res['profit_usd'].idxmax()]
