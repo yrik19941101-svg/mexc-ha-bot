@@ -1,27 +1,29 @@
 import asyncio
 import ccxt.async_support as ccxt
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА СО СЛОЖНЫМ ПРОЦЕНТОМ ($50) ====================
+# ==================== НАСТРОЙКИ ОПТИМИЗИРОВАННОГО БЭКТЕСТА ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 30           # 30 дней (720 часовых свечей)
 INITIAL_BALANCE_USD = 50.00     # Стартовый депозит: $50.00
-MARGIN_PCT_OF_BALANCE = 0.10    # 10% от текущего депозита на каждую сделку
+MARGIN_PCT_OF_BALANCE = 0.05    # Безопасные 5% от депозита на сделку (гибридный сложный %)
 MIN_MARGIN_USD = 0.50           # Минимальный порог маржи
-MAX_MARGIN_USD = 200.0          # Защитный потолок маржи
+MAX_MARGIN_USD = 100.0          # Защитный потолок маржи
 ASSUMED_LEVERAGE = 15           # Плечо 15x
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit Futures: 0.11% за круг
 MAX_HOLD_HOURS = 48             # Принудительное закрытие через 48 часов
 PAIRS_LIMIT = 50                # Топ-50 пар Bybit для теста
 
-# Стратегические профили для сравнения:
-PROFILES_TO_TEST = [
-    {"id": 1, "tp": 0.80, "sl": 0.60, "use_lock": False, "name": "Профиль #1 (TP +80% / без БУ)"},
-    {"id": 2, "tp": 1.20, "sl": 0.60, "use_lock": True,  "name": "Профиль #2 (TP +120% / с ПлюсБУ +10%)"}
-]
+# Новые фильтры отсечения флета:
+MIN_BODY_PCT = 0.60             # Увеличенное тело Heikin Ashi >= 0.60% (только сильные импульсы)
+MAX_WICK_PCT = 0.10             # Строгая обратная тень <= 0.10%
+ATR_PERIOD = 14                 # Период расчета волатильности
+ATR_MULTIPLIER = 1.2            # Текущая свеча должна быть больше ATR * 1.2 (фильтр всплеска активности)
 
-MIN_BODY_PCT = 0.50             # Тело Heikin Ashi >= 0.50%
-MAX_WICK_PCT = 0.15             # Обратная тень <= 0.15%
-# ====================================================================================
+PROFILES_TO_TEST = [
+    {"id": 1, "tp": 0.80, "sl": 0.60, "use_lock": False, "name": "Оптимизированный Профиль #1 (TP +80% / без БУ)"},
+    {"id": 2, "tp": 1.20, "sl": 0.60, "use_lock": True,  "name": "Оптимизированный Профиль #2 (TP +120% / с ПлюсБУ)"}
+]
+# ==============================================================================
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -40,13 +42,15 @@ def calculate_heikin_ashi(ohlcv):
         color = "GREEN" if ha_close > ha_open else "RED"
         upper_wick_pct = (ha_high - max(ha_open, ha_close)) / ha_open * 100.0 if ha_open > 0 else 0.0
         lower_wick_pct = (min(ha_open, ha_close) - ha_low) / ha_open * 100.0 if ha_open > 0 else 0.0
+        true_range = h - l
 
         ha_candles.append({
             "timestamp": ts,
             "ha_open": ha_open, "ha_high": ha_high, "ha_low": ha_low, "ha_close": ha_close,
             "real_open": o, "real_high": h, "real_low": l, "real_close": c,
             "body_pct": body_pct, "color": color,
-            "upper_wick_pct": upper_wick_pct, "lower_wick_pct": lower_wick_pct
+            "upper_wick_pct": upper_wick_pct, "lower_wick_pct": lower_wick_pct,
+            "true_range": true_range
         })
     return ha_candles
 
@@ -59,6 +63,17 @@ def calculate_ema(closes, period):
     for price in closes[period:]:
         ema.append((price - ema[-1]) * multiplier + ema[-1])
     return [ema[0]] * (period - 1) + ema
+
+
+def calculate_atr(ha_candles, period):
+    tr_list = [c["true_range"] for c in ha_candles]
+    if len(tr_list) < period:
+        return [sum(tr_list) / len(tr_list)] * len(tr_list)
+    atr = [sum(tr_list[:period]) / period]
+    for tr in tr_list[period:]:
+        next_atr = (atr[-1] * (period - 1) + tr) / period
+        atr.append(next_atr)
+    return [atr[0]] * (period - 1) + atr
 
 
 async def get_affordable_bybit_symbols(exchange, all_swaps):
@@ -81,8 +96,8 @@ async def get_affordable_bybit_symbols(exchange, all_swaps):
     return affordable
 
 
-async def run_compounding_backtest():
-    print(f"🚀 Запуск бэктеста со СЛОЖНЫМ ПРОЦЕНТОМ за {DAYS_TO_BACKTEST} дней (Старт: ${INITIAL_BALANCE_USD:.2f})...", flush=True)
+async def run_optimized_backtest():
+    print(f"🚀 Запуск ОПТИМИЗИРОВАННОГО бэктеста с фильтром флета за {DAYS_TO_BACKTEST} дней (Старт: ${INITIAL_BALANCE_USD:.2f})...", flush=True)
     exchange = ccxt.bybit({
         "enableRateLimit": True,
         "options": {"defaultType": "linear"}
@@ -106,15 +121,18 @@ async def run_compounding_backtest():
             if ohlcv and len(ohlcv) > 100:
                 ha_candles = calculate_heikin_ashi(ohlcv)
                 closes = [c["real_close"] for c in ha_candles]
+                ema20 = calculate_ema(closes, 20)
+                atr14 = calculate_atr(ha_candles, ATR_PERIOD)
                 cached_market_data[sym] = {
                     "ha_candles": ha_candles,
-                    "ema20": calculate_ema(closes, 20)
+                    "ema20": ema20,
+                    "atr14": atr14
                 }
         except Exception:
             pass
 
     await exchange.close()
-    print(f"💾 Закешировано пар: {len(cached_market_data)}. Симулируем разгон депозита со сложным процентом...\n", flush=True)
+    print(f"💾 Закешировано пар: {len(cached_market_data)}. Запускаем симуляцию...\n", flush=True)
 
     if not cached_market_data:
         print("❌ Нет данных для анализа.", flush=True)
@@ -125,6 +143,7 @@ async def run_compounding_backtest():
     for sym, data in cached_market_data.items():
         ha_candles = data["ha_candles"]
         ema_values = data["ema20"]
+        atr_values = data["atr14"]
 
         for idx in range(30, len(ha_candles) - MAX_HOLD_HOURS):
             prev_c = ha_candles[idx - 1]
@@ -133,9 +152,13 @@ async def run_compounding_backtest():
             if curr_c["body_pct"] < MIN_BODY_PCT:
                 continue
 
+            # Фильтр волатильности ATR: свеча должна быть активной
+            if curr_c["true_range"] < (atr_values[idx] * ATR_MULTIPLIER):
+                continue
+
             current_price = curr_c["real_close"]
             ema_now = ema_values[idx]
-            ema_prev = ema_values[idx - 3]
+            ema_prev = ema_values[idx - 5]  жжесткий фильтр наклона EMA за 5 часов
 
             target_dir = None
             if prev_c["color"] == "RED" and curr_c["color"] == "GREEN":
@@ -159,7 +182,7 @@ async def run_compounding_backtest():
     all_potential_trades.sort(key=lambda x: x["timestamp"])
 
     print("="*95, flush=True)
-    print(f"📈 РЕЗУЛЬТАТЫ РАЗГОНА ДЕПОЗИТА СО СЛОЖНЫМ ПРОЦЕНТОМ (Старт: ${INITIAL_BALANCE_USD:.2f}):", flush=True)
+    print(f"📈 РЕЗУЛЬТАТЫ ОПТИМИЗИРОВАННОЙ ТОРГОВЛИ (Фильтр флета ATR + Слот 5% от депо):", flush=True)
     print("="*95, flush=True)
 
     for profile in PROFILES_TO_TEST:
@@ -293,9 +316,9 @@ async def run_compounding_backtest():
         )
 
     print("="*95, flush=True)
-    print("⏸ Бэктест завершен. Ожидание...", flush=True)
+    print("⏸ Оптимизированный бэктест завершен.", flush=True)
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(run_compounding_backtest())
+    asyncio.run(run_optimized_backtest())
