@@ -2,10 +2,11 @@ import ccxt
 import pandas as pd
 import numpy as np
 
-def calculate_indicators(df):
-    """Рассчитывает технические индикаторы на основе DataFrame со свечами."""
-    # 1. Экспоненциальная средняя (EMA20)
+def calculate_strategy_indicators(df):
+    """Рассчитывает индикаторы для импульсной стратегии."""
+    # 1. Скользящие средние для тренда
     df['ema20'] = df['close'].ewm(span=20).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
     
     # 2. Полосы Боллинджера (20, 2)
     df['sma20'] = df['close'].rolling(window=20).mean()
@@ -20,59 +21,81 @@ def calculate_indicators(df):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # 4. Анализ объемов (сравнение с 20-периодной средней)
+    # 4. Объемный всплеск (в 2 раза выше средних 20 свечей)
     df['vol_ma20'] = df['volume'].rolling(window=20).mean()
-    df['high_volume'] = df['volume'] > (df['vol_ma20'] * 1.5) # Объем выше среднего в 1.5 раза
+    df['volume_spike'] = df['volume'] > (df['vol_ma20'] * 2.0)
     
     return df
 
-def analyze_market_with_indicators():
-    """Выгружает топ-30 монет и анализирует рынок за последние 30 дней."""
-    print("Подключение к бирже и поиск ликвидных фьючерсов...")
+def run_smart_strategy():
+    print("Подключение к Binance Futures и загрузка данных за 30 дней...")
     exchange = ccxt.binance({'options': {'defaultType': 'future'}})
     exchange.load_markets()
     
-    # Получаем топ-30 по суточному объему (quoteVolume)
+    # Получаем топ-30 монет по объему
     tickers = exchange.fetch_tickers()
     futures_tickers = {s: d for s, d in tickers.items() if 'USDT' in s and d.get('quoteVolume')}
     sorted_coins = sorted(futures_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)
     top_30 = [item[0] for item in sorted_coins[:30]]
     
-    print(f"Топ-30 ликвидных монет получено. Начинаем глубокий анализ за 30 дней...")
-    strategy_signals = {}
+    strategy_results = {}
+    
+    print(f"Анализ {len(top_30)} монет по импульсной стратегии...")
     
     for symbol in top_30:
         try:
-            # 720 часовых свечей = ровно 30 дней истории (24 часа * 30 дней)
+            # 720 часовых свечей = 30 дней
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=720)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df = calculate_indicators(df)
+            df = calculate_strategy_indicators(df)
             
             last = df.iloc[-1]
+            prev = df.iloc[-2] # Предыдущая свеча для поиска пробоя
             
-            # Условия для стратегии:
-            is_oversold = last['close'] <= last['lower_band'] and last['rsi'] < 30
-            is_overbought = last['close'] >= last['upper_band'] and last['rsi'] > 70
+            current_price = float(last['close'])
+            rsi_val = float(last['rsi']) if not pd.isna(last['rsi']) else 50.0
             
-            if is_oversold and last['high_volume']:
-                signal = 'STRONG_BUY_DIP'
-            elif is_overbought:
-                signal = 'STRONG_SELL_TOP'
+            # Логика стратегии «Импульсный пробой волатильности»
+            # Условия для покупки: 
+            # 1. Цена пробила верхнюю полосу Боллинджера
+            # 2. Наблюдается мощный всплеск объема
+            # 3. RSI вышел из зоны накопления (> 50, но еще не перекуплен < 75)
+            is_breakout = (prev['close'] <= prev['upper_band']) and (current_price > last['upper_band'])
+            
+            if is_breakout and last['volume_spike'] and (55 < rsi_val < 75):
+                signal = 'STRONG_BUY_BREAKOUT'
+                # Расчет уровней риск-менеджмента для стратегии
+                entry_price = current_price
+                stop_loss = round(entry_price * 0.97, 4)   # Риск 3%
+                take_profit = round(entry_price * 1.06, 4) # Цель +6% (ROI профит)
             else:
-                signal = 'NEUTRAL'
+                signal = 'WAIT / HOLD'
+                entry_price = current_price
+                stop_loss = 0
+                take_profit = 0
                 
-            strategy_signals[symbol] = {
-                'close': float(last['close']),
-                'rsi': round(float(last['rsi']), 2) if not pd.isna(last['rsi']) else 0.0,
-                'signal': signal
+            strategy_results[symbol] = {
+                'price': entry_price,
+                'rsi': round(rsi_val, 2),
+                'signal': signal,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit
             }
         except Exception as e:
-            print(f"Ошибка при обработке монеты {symbol}: {e}")
+            print(f"Ошибка по монете {symbol}: {e}")
             
-    return strategy_signals
+    return strategy_results
 
 if __name__ == "__main__":
-    signals = analyze_market_with_indicators()
-    print("\n--- Результаты анализа стратегии за 30 дней ---")
-    for coin, data in signals.items():
-        print(f"{coin} -> Цена: {data['close']}, RSI: {data['rsi']}, Сигнал: {data['signal']}")
+    results = run_smart_strategy()
+    print("\n==============================================")
+    print("      РЕЗУЛЬТАТЫ ИМПУЛЬСНОЙ СТРАТЕГИИ ТОРГОВЛИ     ")
+    print("==============================================")
+    for coin, data in results.items():
+        if data['signal'] == 'STRONG_BUY_BREAKOUT':
+            print(f"🚀 СИГНАЛ НА ПОКУПКУ: {coin}")
+            print(f"   Цена входа: {data['price']} | RSI: {data['rsi']}")
+            print(f"   Стоп-лосс: {data['stop_loss']} | Тейк-профит: {data['take_profit']}")
+            print("-" * 46)
+        else:
+            print(f"{coin} -> Цена: {data['price']}, RSI: {data['rsi']}, Статус: {data['signal']}")
