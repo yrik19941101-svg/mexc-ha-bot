@@ -11,7 +11,7 @@ SYMBOLS = [
 ]
 
 def fetch_historical_data(exchange, symbol, timeframe='1h', days=60):
-    """Загрузка данных за 60 дней (1440 часовых свечей) в два запроса"""
+    """Загрузка данных за 60 дней (1440 часовых свечей)"""
     try:
         now = exchange.milliseconds()
         since = now - days * 24 * 60 * 60 * 1000
@@ -34,48 +34,52 @@ def fetch_historical_data(exchange, symbol, timeframe='1h', days=60):
         return None
 
 def prepare_indicators(df):
-    """Расчет структуры, тренда и волатильности (ATR) без заглядывания в будущее"""
-    # EMA для фильтрации глобального направления
+    """Расчет трендовых EMA и волатильности ATR"""
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema150'] = df['close'].ewm(span=150, adjust=False).mean()
+    df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     
-    # ATR (14) для расчета адаптивных стопов и импульсов
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift(1)).abs()
     low_close = (df['low'] - df['close'].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     
-    # Размер тела свечи
     df['body'] = (df['close'] - df['open']).abs()
     return df
 
 def backtest_strategy(df, symbol):
     initial_capital = 150.0
     capital = initial_capital
-    risk_per_trade = 0.02  # Риск 2% ($3 на старте)
+    risk_per_trade = 0.02  # Фиксированный риск 2% от депозита
     
     opens = df['open'].values
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
+    ema20 = df['ema20'].values
     ema50 = df['ema50'].values
-    ema150 = df['ema150'].values
+    ema100 = df['ema100'].values
     atrs = df['atr'].values
     bodies = df['body'].values
     
+    # Списки активных нетестированных (свежих) зон
+    demand_zones = []  # [{'bottom': float, 'top': float, 'bar': int}]
+    supply_zones = []  # [{'bottom': float, 'top': float, 'bar': int}]
+    
     in_position = False
-    pos_type = None        # 'LONG' или 'SHORT'
+    pos_type = None
     entry_price = 0.0
     stop_loss = 0.0
-    tp1_price = 0.0        # Уровень 1R (фиксация 50% и перенос в БУ)
-    tp2_price = 0.0        # Уровень 2.2R (полный тейк)
-    be_activated = False   # Флаг перевода в безубыток
+    tp1_price = 0.0
+    tp2_price = 0.0
+    be_activated = False
     risk_usd = 0.0
+    entry_bar = 0
     
     trades = []
     
-    for i in range(150, len(df)):
+    for i in range(100, len(df)):
         if capital <= 10:
             break
             
@@ -87,40 +91,74 @@ def backtest_strategy(df, symbol):
         
         if np.isnan(curr_atr) or curr_atr == 0:
             continue
-            
-        # 1. СОПРОВОЖДЕНИЕ ОТКРЫТОЙ ПОЗИЦИИ
+
+        # -------------------------------------------------------------------------
+        # 1. ПОИСК И РЕГИСТРАЦИЯ НОВЫХ ЗОН СПРОСА И ПРЕДЛОЖЕНИЯ (С ПОДТВЕРЖДЕНИЕМ)
+        # -------------------------------------------------------------------------
+        # Проверяем свечу p = i - 3 (подтвержденный экстремум с импульсным выходом)
+        p = i - 3
+        if p >= 10:
+            # Проверка формирования Зоны Спроса (Swing Low + импульс вверх)
+            is_swing_low = (lows[p] <= np.min(lows[p-5:p])) and (lows[p] <= np.min(lows[p+1:i+1]))
+            impulse_up = ( np.max(highs[p+1:i+1]) - lows[p] ) >= (atrs[p] * 1.3)
+            if is_swing_low and impulse_up and (closes[i] > highs[p]):
+                demand_zones.append({
+                    'bottom': lows[p],
+                    'top': lows[p] + atrs[p] * 0.65,
+                    'bar': p
+                })
+                
+            # Проверка формирования Зоны Предложения (Swing High + импульс вниз)
+            is_swing_high = (highs[p] >= np.max(highs[p-5:p])) and (highs[p] >= np.max(highs[p+1:i+1]))
+            impulse_down = ( highs[p] - np.min(lows[p+1:i+1]) ) >= (atrs[p] * 1.3)
+            if is_swing_high and impulse_down and (closes[i] < lows[p]):
+                supply_zones.append({
+                    'bottom': highs[p] - atrs[p] * 0.65,
+                    'top': highs[p],
+                    'bar': p
+                })
+
+        # Очистка пробитых (инвалидированных) и устаревших зон (>120 часов)
+        demand_zones = [
+            z for z in demand_zones 
+            if (curr_close >= z['bottom']) and (i - z['bar'] <= 120)
+        ]
+        supply_zones = [
+            z for z in supply_zones 
+            if (curr_close <= z['top']) and (i - z['bar'] <= 120)
+        ]
+
+        # -------------------------------------------------------------------------
+        # 2. СОПРОВОЖДЕНИЕ ОТКРЫТОЙ ПОЗИЦИИ
+        # -------------------------------------------------------------------------
         if in_position:
             if pos_type == 'LONG':
-                # Сначала проверяем стоп-лосс (консервативный тест)
                 if curr_low <= stop_loss:
                     if be_activated:
-                        # Вторая половина закрылась по безубытку, но первая дала +0.5R
-                        capital += risk_usd * 0.55
+                        # 60% закрыто на 1.2R (+0.72R), остаток 40% закрыт в БУ
+                        capital += risk_usd * 0.72
                         trades.append('WIN')
                     else:
-                        # Полный стоп (-1R)
                         capital -= risk_usd
                         trades.append('LOSS')
                     in_position = False
                     continue
                 
-                # Проверка полного тейк-профита (TP2 = 2.2R)
                 if curr_high >= tp2_price:
-                    # 50% закрыто на 1R (+0.5R) и 50% на 2.2R (+1.1R) = +1.6R чистыми
-                    capital += risk_usd * 1.6
+                    # 60% на 1.2R (+0.72R) + 40% на 2.4R (+0.96R) = +1.68R
+                    capital += risk_usd * 1.68
                     trades.append('WIN')
                     in_position = False
                     continue
                     
-                # Проверка первого тейка (TP1 = 1.0R) -> перенос стопа в безубыток
                 if not be_activated and curr_high >= tp1_price:
                     be_activated = True
-                    stop_loss = entry_price  # Стоп в безубыток
+                    stop_loss = entry_price  # Перевод остатка в безубыток
                     
             elif pos_type == 'SHORT':
                 if curr_high >= stop_loss:
                     if be_activated:
-                        capital += risk_usd * 0.55
+                        capital += risk_usd * 0.72
                         trades.append('WIN')
                     else:
                         capital -= risk_usd
@@ -129,7 +167,7 @@ def backtest_strategy(df, symbol):
                     continue
                     
                 if curr_low <= tp2_price:
-                    capital += risk_usd * 1.6
+                    capital += risk_usd * 1.68
                     trades.append('WIN')
                     in_position = False
                     continue
@@ -140,58 +178,78 @@ def backtest_strategy(df, symbol):
                     
             continue
 
-        # 2. ПОИСК ТОЧКИ ВХОДА (Зона спроса/предложения + подтверждение разворота)
-        # Определяем глобальный тренд
-        uptrend = (curr_close > ema150[i]) and (ema50[i] > ema150[i])
-        downtrend = (curr_close < ema150[i]) and (ema50[i] < ema150[i])
+        # -------------------------------------------------------------------------
+        # 3. ПОИСК ТОЧКИ ВХОДА ОТ СВЕЖИХ ЗОН С ПОДТВЕРЖДЕНИЕМ
+        # -------------------------------------------------------------------------
+        uptrend = (curr_close > ema100[i]) and (ema20[i] >= ema50[i] * 0.998)
+        downtrend = (curr_close < ema100[i]) and (ema20[i] <= ema50[i] * 1.002)
         
-        # Окно поиска недавней зоны консолидации/импульса (последние 20 свечей)
-        zone_low = np.min(lows[i-20:i-2])
-        zone_high = np.max(highs[i-20:i-2])
-        
-        # --- СЦЕНАРИЙ LONG (Зона спроса + бычий слом/поглощение) ---
-        if uptrend:
-            # Цена недавно спустилась в нижнюю часть диапазона (зону спроса)
-            touched_demand = (curr_low <= zone_low + curr_atr * 0.8) or (lows[i-1] <= zone_low + curr_atr * 0.8)
-            # Подтверждение (Шаг 3): текущая свеча бычья и закрылась выше максимума предыдущей свечи (локальный слом вверх)
-            bullish_confirm = (curr_close > curr_open) and (curr_close > highs[i-1]) and (bodies[i] > curr_atr * 0.25)
-            
-            if touched_demand and bullish_confirm:
-                stop_price = min(curr_low, lows[i-1]) - (curr_atr * 0.3)
-                risk_dist = curr_close - stop_price
-                
-                if risk_dist > 0 and (risk_dist / curr_close) < 0.04:  # Фильтр адекватного стопа (<4%)
-                    in_position = True
-                    pos_type = 'LONG'
-                    entry_price = curr_close
-                    stop_loss = stop_price
-                    tp1_price = entry_price + (risk_dist * 1.0)  # На 1R берем часть и ставим БУ
-                    tp2_price = entry_price + (risk_dist * 2.2)  # Основная цель
-                    be_activated = False
-                    risk_usd = capital * risk_per_trade
-                    continue
+        candle_range = curr_high - curr_low
+        if candle_range == 0:
+            continue
 
-        # --- СЦЕНАРИЙ SHORT (Зона предложения + медвежий слом/поглощение) ---
-        if downtrend:
-            # Цена поднялась в верхнюю часть диапазона (зону предложения)
-            touched_supply = (curr_high >= zone_high - curr_atr * 0.8) or (highs[i-1] >= zone_high - curr_atr * 0.8)
-            # Подтверждение: текущая свеча медвежья и пробила минимум предыдущей свечи (локальный слом вниз)
-            bearish_confirm = (curr_close < curr_open) and (curr_close < lows[i-1]) and (bodies[i] > curr_atr * 0.25)
-            
-            if touched_supply and bearish_confirm:
-                stop_price = max(curr_high, highs[i-1]) + (curr_atr * 0.3)
-                risk_dist = stop_price - curr_close
+        # --- ВХОД В LONG ОТ СВЕЖЕЙ ЗОНЫ СПРОСА ---
+        if uptrend and demand_zones:
+            # Ищем зону, которую цена протестировала на текущем или прошлом баре
+            matched_zone = None
+            for z in reversed(demand_zones):
+                if (i - z['bar'] >= 5) and (curr_low <= z['top'] or lows[i-1] <= z['top']):
+                    matched_zone = z
+                    break
+                    
+            if matched_zone is not None:
+                # Подтверждение реакции: бычий слом предыдущего бара ИЛИ сильный выкуп (пин-бар) от зоны
+                bull_break = (curr_close > curr_open) and (curr_close > highs[i-1]) and (bodies[i] > curr_atr * 0.2)
+                bull_pinbar = (curr_close > curr_open) and ((curr_close - curr_low) / candle_range >= 0.65) and (curr_close > closes[i-1])
                 
-                if risk_dist > 0 and (risk_dist / curr_close) < 0.04:
-                    in_position = True
-                    pos_type = 'SHORT'
-                    entry_price = curr_close
-                    stop_loss = stop_price
-                    tp1_price = entry_price - (risk_dist * 1.0)
-                    tp2_price = entry_price - (risk_dist * 2.2)
-                    be_activated = False
-                    risk_usd = capital * risk_per_trade
-                    continue
+                if bull_break or bull_pinbar:
+                    stop_price = min(matched_zone['bottom'], curr_low, lows[i-1]) - (curr_atr * 0.25)
+                    risk_dist = curr_close - stop_price
+                    
+                    # Фильтр Анти-Фомо: не входим, если свеча уже улетела (>1.5 ATR)
+                    if (curr_atr * 0.35) <= risk_dist <= (curr_atr * 1.55):
+                        in_position = True
+                        pos_type = 'LONG'
+                        entry_price = curr_close
+                        stop_loss = stop_price
+                        tp1_price = entry_price + (risk_dist * 1.2)
+                        tp2_price = entry_price + (risk_dist * 2.4)
+                        be_activated = False
+                        risk_usd = capital * risk_per_trade
+                        entry_bar = i
+                        # Удаляем зону (она отработана!)
+                        demand_zones.remove(matched_zone)
+                        continue
+
+        # --- ВХОД В SHORT ОТ СВЕЖЕЙ ЗОНЫ ПРЕДЛОЖЕНИЯ ---
+        if downtrend and supply_zones:
+            matched_zone = None
+            for z in reversed(supply_zones):
+                if (i - z['bar'] >= 5) and (curr_high >= z['bottom'] or highs[i-1] >= z['bottom']):
+                    matched_zone = z
+                    break
+                    
+            if matched_zone is not None:
+                bear_break = (curr_close < curr_open) and (curr_close < lows[i-1]) and (bodies[i] > curr_atr * 0.2)
+                bear_pinbar = (curr_close < curr_open) and ((curr_high - curr_close) / candle_range >= 0.65) and (curr_close < closes[i-1])
+                
+                if bear_break or bear_pinbar:
+                    stop_price = max(matched_zone['top'], curr_high, highs[i-1]) + (curr_atr * 0.25)
+                    risk_dist = stop_price - curr_close
+                    
+                    if (curr_atr * 0.35) <= risk_dist <= (curr_atr * 1.55):
+                        in_position = True
+                        pos_type = 'SHORT'
+                        entry_price = curr_close
+                        stop_loss = stop_price
+                        tp1_price = entry_price - (risk_dist * 1.2)
+                        tp2_price = entry_price - (risk_dist * 2.4)
+                        be_activated = False
+                        risk_usd = capital * risk_per_trade
+                        entry_bar = i
+                        # Удаляем зону (она отработана!)
+                        supply_zones.remove(matched_zone)
+                        continue
 
     wins = trades.count('WIN')
     losses = trades.count('LOSS')
@@ -209,7 +267,7 @@ def backtest_strategy(df, symbol):
 
 def main():
     exchange = ccxt.bybit()
-    print(f"Запуск бэктеста v4.0 (1h, 60 дней, LONG+SHORT, подтверждение + БУ на 1R)...\n")
+    print(f"Запуск бэктеста v5.0 (Свежие зоны Order Block + Анти-Фомо фильтр + 1.2R/2.4R)...\n")
     
     results = []
     for symbol in SYMBOLS:
@@ -225,10 +283,12 @@ def main():
             
     if results:
         df_res = pd.DataFrame(results)
-        print("\n" + "="*55)
-        print(" ИТОГОВАЯ СВОДКА v4.0 (ПОДТВЕРЖДЕНИЕ + БЕЗУБЫТОК) ")
-        print("="*55)
+        profitable_pairs = len(df_res[df_res['profit_usd'] > 0])
+        print("\n" + "="*60)
+        print(" ИТОГОВАЯ СВОДКА v5.0 (СВЕЖИЕ ЗОНЫ + АНТИ-ФОМО) ")
+        print("="*60)
         print(f"Всего сделок по портфелю: {df_res['trades'].sum()}")
+        print(f"Плюсовых пар из {len(df_res)}: {profitable_pairs}")
         print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
         print(f"Средний конечный баланс: ${df_res['final_capital'].mean():.2f}")
         print(f"Общий финансовый результат по портфелю: {df_res['profit_usd'].sum():+.2f}$")
@@ -236,7 +296,7 @@ def main():
         worst = df_res.loc[df_res['profit_usd'].idxmin()]
         print(f"Лучшая пара: {best['symbol']} ({best['profit_usd']:+.2f}$)")
         print(f"Худшая пара: {worst['symbol']} ({worst['profit_usd']:+.2f}$)")
-        print("="*55)
+        print("="*60)
 
 if __name__ == "__main__":
     main()
