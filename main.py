@@ -2,32 +2,31 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== ЧИСТЫЕ НАСТРОЙКИ ЛАБОРАТОРИИ ====================
+# ==================== НАСТРОЙКИ АСИММЕТРИЧНОЙ ЛАБОРАТОРИИ ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 30           # Глубина истории: 30 дней
 INITIAL_BALANCE_USD = 100.00    # Стартовый депозит: $100.00
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit (0.11% за круг)
-MAX_HOLD_HOURS = 24             # Максимальное удержание позиции
+MAX_HOLD_HOURS = 36             # Максимальное удержание позиции
 PAIRS_LIMIT = 30                # Топ-30 пар Bybit
-# ======================================================================
+# ============================================================================
 
 
-def calculate_clean_indicators(ohlcv):
+def calculate_asymmetric_indicators(ohlcv):
     closes = [c[4] for c in ohlcv]
     highs = [c[2] for c in ohlcv]
     lows = [c[3] for c in ohlcv]
     
-    def sma(period):
-        res = []
-        for i in range(len(closes)):
-            if i < period - 1:
-                res.append(closes[i])
-            else:
-                res.append(sum(closes[i - period + 1:i + 1]) / period)
-        return res
+    def ema(series, period):
+        if len(series) < period:
+            return [sum(series) / len(series)] * len(series)
+        res = [sum(series[:period]) / period]
+        mult = 2.0 / (period + 1)
+        for val in series[period:]:
+            res.append((val - res[-1]) * mult + res[-1])
+        return [res[0]] * (period - 1) + res
 
-    sma20 = sma(20)
-    sma50 = sma(50)
+    ema200 = ema(closes, 200)
 
     # RSI (14)
     rsi = [50.0] * len(closes)
@@ -41,18 +40,18 @@ def calculate_clean_indicators(ohlcv):
             al = sum(losses[-14:]) / 14
             rsi[i] = 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + (ag / al)))
 
-    # MACD (12, 26, 9)
-    def ema(series, period):
-        res = [series[0]]
-        mult = 2.0 / (period + 1)
-        for val in series[1:]:
-            res.append((val - res[-1]) * mult + res[-1])
-        return res
-
-    ema12 = ema(closes, 12)
-    ema26 = ema(closes, 26)
-    macd_line = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
-    signal_line = ema(macd_line, 9)
+    # Bollinger Bands (20, 2)
+    bb_upper, bb_lower = [], []
+    for i in range(len(closes)):
+        if i < 20:
+            bb_upper.append(closes[i] * 1.02)
+            bb_lower.append(closes[i] * 0.98)
+        else:
+            win = closes[i - 19:i + 1]
+            mean = sum(win) / 20
+            stdev = (sum((x - mean) ** 2 for x in win) / 20) ** 0.5
+            bb_upper.append(mean + (2 * stdev))
+            bb_lower.append(mean - (2 * stdev))
 
     indicators = []
     for i in range(len(closes)):
@@ -61,29 +60,28 @@ def calculate_clean_indicators(ohlcv):
             "close": closes[i],
             "high": highs[i],
             "low": lows[i],
-            "sma20": sma20[i],
-            "sma50": sma50[i],
+            "ema200": ema200[i],
             "rsi": rsi[i],
-            "macd": macd_line[i],
-            "macd_signal": signal_line[i]
+            "bb_upper": bb_upper[i],
+            "bb_lower": bb_lower[i]
         })
     return indicators
 
 
-def evaluate_clean_strategy(strategy, market_data):
+def evaluate_asymmetric_strategy(strategy, market_data):
     sim_balance = INITIAL_BALANCE_USD
     wins, losses = 0, 0
     peak = INITIAL_BALANCE_USD
     max_dd = 0.0
 
     entry_rule = strategy["entry"]
-    tp_mult = strategy["tp"]
-    sl_mult = strategy["sl"]
+    tp_mult = strategy["tp"]  # Теперь асимметрично выше (например, 3.0x)
+    sl_mult = strategy["sl"]  # Короткий стоп (например, 1.0x)
     leverage = strategy["leverage"]
 
     for sym, bars in market_data.items():
         pair_busy = -1
-        for i in range(100, len(bars) - MAX_HOLD_HOURS):
+        for i in range(200, len(bars) - MAX_HOLD_HOURS):
             if i <= pair_busy:
                 continue
 
@@ -92,26 +90,25 @@ def evaluate_clean_strategy(strategy, market_data):
             price = bar["close"]
             direction = None
 
-            if entry_rule == "rsi_bounce":
-                if bar["rsi"] < 35 and prev["rsi"] >= 35:
+            # Фильтр тренда по EMA 200
+            is_bullish_trend = price > bar["ema200"]
+            is_bearish_trend = price < bar["ema200"]
+
+            if entry_rule == "rsi_trend_pullback":
+                if is_bullish_trend and bar["rsi"] < 40 and prev["rsi"] >= 40:
                     direction = "LONG"
-                elif bar["rsi"] > 65 and prev["rsi"] <= 65:
+                elif is_bearish_trend and bar["rsi"] > 60 and prev["rsi"] <= 60:
                     direction = "SHORT"
-            elif entry_rule == "macd_cross":
-                if bar["macd"] > bar["macd_signal"] and prev["macd"] <= prev["macd_signal"]:
+            elif entry_rule == "bb_trend_breakout":
+                if is_bullish_trend and bar["close"] > bar["bb_upper"] and prev["close"] <= prev["bb_upper"]:
                     direction = "LONG"
-                elif bar["macd"] < bar["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
-                    direction = "SHORT"
-            elif entry_rule == "sma_cross":
-                if bar["sma20"] > bar["sma50"] and prev["sma20"] <= prev["sma50"]:
-                    direction = "LONG"
-                elif bar["sma20"] < bar["sma50"] and prev["sma20"] >= prev["sma50"]:
+                elif is_bearish_trend and bar["close"] < bar["bb_lower"] and prev["close"] >= prev["bb_lower"]:
                     direction = "SHORT"
 
             if not direction:
                 continue
 
-            # Сложный процент: маржа строго 1% от текущего баланса
+            # Сложный процент: маржа 1% от текущего баланса
             margin = max(0.50, round(sim_balance * 0.01, 2))
             if sim_balance < margin:
                 break
@@ -179,7 +176,7 @@ def evaluate_clean_strategy(strategy, market_data):
                 losses += 1
 
     total_trades = wins + losses
-    if total_trades < 10:
+    if total_trades < 8:
         return None
 
     winrate = (wins / total_trades) * 100.0
@@ -195,8 +192,8 @@ def evaluate_clean_strategy(strategy, market_data):
     }
 
 
-async def run_clean_lab():
-    print(f"🧪 Запуск Чистой Лаборатории (Старт: ${INITIAL_BALANCE_USD}, Сложн. % ставки 1%, плавающее плечо)...", flush=True)
+async def run_asymmetric_lab():
+    print(f"🧪 Запуск Асимметричной Лаборатории (TP 3x / SL 1x + Тренд EMA200)...", flush=True)
     exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "linear"}})
 
     markets = await exchange.load_markets(True)
@@ -205,55 +202,55 @@ async def run_clean_lab():
         if m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active", True)
     ][:PAIRS_LIMIT]
 
-    print(f"📊 Загружаем данные по {len(all_swaps)} парам Bybit...", flush=True)
+    print(f"📊 Загружаем историю по {len(all_swaps)} парам Bybit...", flush=True)
     since_ts = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
     market_data = {}
 
     for sym in all_swaps:
         try:
             ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_ts, limit=1000)
-            if ohlcv and len(ohlcv) > 200:
-                market_data[sym] = calculate_clean_indicators(ohlcv)
+            if ohlcv and len(ohlcv) > 250:
+                market_data[sym] = calculate_asymmetric_indicators(ohlcv)
         except Exception:
             pass
 
     await exchange.close()
-    print(f"💾 Закешировано пар: {len(market_data)}. Перебираем комбинации...\n", flush=True)
+    print(f"💾 Закешировано пар: {len(market_data)}. Тестируем асимметричные стратегии...\n", flush=True)
 
-    rules = ["rsi_bounce", "macd_cross", "sma_cross"]
-    tp_grid = [1.0, 2.0]
-    sl_grid = [1.0, 1.5]
-    leverage_grid = [3, 5, 10, 15, 20]  # Тестируем разные плечи с нуля
+    rules = ["rsi_trend_pullback", "bb_trend_breakout"]
+    tp_grid = [2.5, 3.0, 4.0]  # Асимметричный высокий тейк
+    sl_grid = [1.0]            # Короткий стоп
+    leverage_grid = [5, 10, 15]
 
     strategies = [{"entry": r, "tp": tp, "sl": sl, "leverage": lev} for r, tp, sl, lev in product(rules, tp_grid, sl_grid, leverage_grid)]
-    print(f"🧬 Всего стратегий для тестирования: {len(strategies)}\n", flush=True)
+    print(f"🧬 Всего асимметричных вариантов для проверки: {len(strategies)}\n", flush=True)
 
     results = []
     for idx, strat in enumerate(strategies, 1):
-        res = evaluate_clean_strategy(strat, market_data)
+        res = evaluate_asymmetric_strategy(strat, market_data)
         if res:
             results.append(res)
-            print(f"[{idx}/{len(strategies)}] ✅ {strat['entry']} (Плечо: {strat['leverage']}x, TP:{strat['tp']}x) -> Баланс: ${res['balance']:.2f} | Прибыль: ${res['profit']:+.2f}", flush=True)
+            print(f"[{idx}/{len(strategies)}] ✅ {strat['entry']} (Плечо:{strat['leverage']}x, TP:{strat['tp']}x) -> Баланс: ${res['balance']:.2f} | Прибыль: ${res['profit']:+.2f}", flush=True)
         else:
             print(f"[{idx}/{len(strategies)}] ❌ Мало сделок / слив", flush=True)
 
     results.sort(key=lambda x: x["profit"], reverse=True)
 
-    print("\n" + "="*110, flush=True)
-    print("🏆 ТОП-3 ЛУЧШИЕ СТРАТЕГИИ ПО ИТОГАМ ЧИСТОГО ТЕСТА:", flush=True)
-    print("="*110, flush=True)
+    print("\n" + "="*115, flush=True)
+    print("🏆 ТОП-3 ЛУЧШИЕ АСИММЕТРИЧНЫЕ СТРАТЕГИИ:", flush=True)
+    print("="*115, flush=True)
     for i, r in enumerate(results[:3], 1):
         s = r["strategy"]
         print(
-            f"#{i} | Логика: {s['entry']:<15} | Плечо: {s['leverage']:>2}x | TP: {s['tp']}x | SL: {s['sl']}x | "
+            f"#{i} | Логика: {s['entry']:<20} | Плечо: {s['leverage']:>2}x | TP: {s['tp']}x | SL: {s['sl']}x | "
             f"Итог: <b>${r['balance']:>6.2f}</b> (Прибыль: <b>${r['profit']:>+6.2f}</b>) | "
             f"Винрейт: {r['winrate']:>5.1f}% | Сделок: {r['trades']:>3} | Просадка: {r['dd']:>5.1f}%",
             flush=True
         )
-    print("="*110, flush=True)
+    print("="*115, flush=True)
 
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(run_clean_lab())
+    asyncio.run(run_asymmetric_lab())
