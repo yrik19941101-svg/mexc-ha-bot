@@ -1,3 +1,1 @@
-pybit==5.8.0
-aiohttp==3.10.5
-python-dotenv==1.0.1
+ccxt
