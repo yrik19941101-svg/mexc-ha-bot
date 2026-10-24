@@ -2,9 +2,9 @@ import asyncio
 import ccxt.async_support as ccxt
 from itertools import product
 
-# ==================== НАСТРОЙКИ АСИММЕТРИЧНОЙ ЛАБОРАТОРИИ ====================
+# ==================== НАСТРОЙКИ СТРЕСС-ТЕСТА НА 60 ДНЕЙ ====================
 TIMEFRAME = "1h"
-DAYS_TO_BACKTEST = 30           # Глубина истории: 30 дней
+DAYS_TO_BACKTEST = 60           # Увеличено до 60 дней истории (около 1440 свечей)
 INITIAL_BALANCE_USD = 100.00    # Стартовый депозит: $100.00
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit (0.11% за круг)
 MAX_HOLD_HOURS = 36             # Максимальное удержание позиции
@@ -12,7 +12,7 @@ PAIRS_LIMIT = 30                # Топ-30 пар Bybit
 # ============================================================================
 
 
-def calculate_asymmetric_indicators(ohlcv):
+def calculate_indicators(ohlcv):
     closes = [c[4] for c in ohlcv]
     highs = [c[2] for c in ohlcv]
     lows = [c[3] for c in ohlcv]
@@ -68,15 +68,15 @@ def calculate_asymmetric_indicators(ohlcv):
     return indicators
 
 
-def evaluate_asymmetric_strategy(strategy, market_data):
+def evaluate_strategy(strategy, market_data):
     sim_balance = INITIAL_BALANCE_USD
     wins, losses = 0, 0
     peak = INITIAL_BALANCE_USD
     max_dd = 0.0
 
     entry_rule = strategy["entry"]
-    tp_mult = strategy["tp"]  # Теперь асимметрично выше (например, 3.0x)
-    sl_mult = strategy["sl"]  # Короткий стоп (например, 1.0x)
+    tp_mult = strategy["tp"]
+    sl_mult = strategy["sl"]
     leverage = strategy["leverage"]
 
     for sym, bars in market_data.items():
@@ -90,7 +90,6 @@ def evaluate_asymmetric_strategy(strategy, market_data):
             price = bar["close"]
             direction = None
 
-            # Фильтр тренда по EMA 200
             is_bullish_trend = price > bar["ema200"]
             is_bearish_trend = price < bar["ema200"]
 
@@ -108,7 +107,7 @@ def evaluate_asymmetric_strategy(strategy, market_data):
             if not direction:
                 continue
 
-            # Сложный процент: маржа 1% от текущего баланса
+            # Сложный процент: маржа строго 1% от текущего баланса
             margin = max(0.50, round(sim_balance * 0.01, 2))
             if sim_balance < margin:
                 break
@@ -176,7 +175,7 @@ def evaluate_asymmetric_strategy(strategy, market_data):
                 losses += 1
 
     total_trades = wins + losses
-    if total_trades < 8:
+    if total_trades < 15:
         return None
 
     winrate = (wins / total_trades) * 100.0
@@ -192,8 +191,8 @@ def evaluate_asymmetric_strategy(strategy, market_data):
     }
 
 
-async def run_asymmetric_lab():
-    print(f"🧪 Запуск Асимметричной Лаборатории (TP 3x / SL 1x + Тренд EMA200)...", flush=True)
+async def run_stress_test():
+    print(f"🚀 Запуск СТРЕСС-ТЕСТА на 60 дней (Плечо до 20x, TP до 5.0x)...", flush=True)
     exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "linear"}})
 
     markets = await exchange.load_markets(True)
@@ -202,32 +201,32 @@ async def run_asymmetric_lab():
         if m.get("swap") and m.get("linear") and m.get("quote") == "USDT" and m.get("active", True)
     ][:PAIRS_LIMIT]
 
-    print(f"📊 Загружаем историю по {len(all_swaps)} парам Bybit...", flush=True)
+    print(f"📊 Загружаем историю за 60 дней по {len(all_swaps)} парам Bybit...", flush=True)
     since_ts = exchange.milliseconds() - (DAYS_TO_BACKTEST * 24 * 3600 * 1000)
     market_data = {}
 
     for sym in all_swaps:
         try:
-            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_ts, limit=1000)
-            if ohlcv and len(ohlcv) > 250:
-                market_data[sym] = calculate_asymmetric_indicators(ohlcv)
+            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, since=since_ts, limit=1500)
+            if ohlcv and len(ohlcv) > 500:
+                market_data[sym] = calculate_indicators(ohlcv)
         except Exception:
             pass
 
     await exchange.close()
-    print(f"💾 Закешировано пар: {len(market_data)}. Тестируем асимметричные стратегии...\n", flush=True)
+    print(f"💾 Закешировано пар: {len(market_data)}. Запускаем тест на 60 дней...\n", flush=True)
 
     rules = ["rsi_trend_pullback", "bb_trend_breakout"]
-    tp_grid = [2.5, 3.0, 4.0]  # Асимметричный высокий тейк
-    sl_grid = [1.0]            # Короткий стоп
-    leverage_grid = [5, 10, 15]
+    tp_grid = [3.0, 4.0, 5.0]
+    sl_grid = [1.0]
+    leverage_grid = [10, 15, 20]
 
     strategies = [{"entry": r, "tp": tp, "sl": sl, "leverage": lev} for r, tp, sl, lev in product(rules, tp_grid, sl_grid, leverage_grid)]
-    print(f"🧬 Всего асимметричных вариантов для проверки: {len(strategies)}\n", flush=True)
+    print(f"🧬 Всего вариантов для 60-дневного стресс-теста: {len(strategies)}\n", flush=True)
 
     results = []
     for idx, strat in enumerate(strategies, 1):
-        res = evaluate_asymmetric_strategy(strat, market_data)
+        res = evaluate_strategy(strat, market_data)
         if res:
             results.append(res)
             print(f"[{idx}/{len(strategies)}] ✅ {strat['entry']} (Плечо:{strat['leverage']}x, TP:{strat['tp']}x) -> Баланс: ${res['balance']:.2f} | Прибыль: ${res['profit']:+.2f}", flush=True)
@@ -237,7 +236,7 @@ async def run_asymmetric_lab():
     results.sort(key=lambda x: x["profit"], reverse=True)
 
     print("\n" + "="*115, flush=True)
-    print("🏆 ТОП-3 ЛУЧШИЕ АСИММЕТРИЧНЫЕ СТРАТЕГИИ:", flush=True)
+    print("🏆 ТОП-3 ЛУЧШИЕ СТРАТЕГИИ ПО ИТОГАМ 60 ДНЕЙ СТРЕСС-ТЕСТА:", flush=True)
     print("="*115, flush=True)
     for i, r in enumerate(results[:3], 1):
         s = r["strategy"]
@@ -253,4 +252,4 @@ async def run_asymmetric_lab():
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(run_asymmetric_lab())
+    asyncio.run(run_stress_test())
