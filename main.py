@@ -1,30 +1,27 @@
 import asyncio
 import ccxt.async_support as ccxt
-from itertools import product
 
-# ==================== НАСТРОЙКИ БЭКТЕСТА СО СЛОЖНЫМ ПРОЦЕНТОМ ====================
+# ==================== НАСТРОЙКИ БЭКТЕСТА СО СЛОЖНЫМ ПРОЦЕНТОМ ($50) ====================
 TIMEFRAME = "1h"
 DAYS_TO_BACKTEST = 30           # 30 дней (720 часовых свечей)
-INITIAL_BALANCE_USD = 5.00      # Стартовый депозит для теста: $5.00
-MARGIN_PCT_OF_BALANCE = 0.10    # 10% от депозита на каждую сделку
-MIN_MARGIN_USD = 0.50           # Минимальная маржа ($0.50)
-MAX_MARGIN_USD = 100.0          # Максимальный потолок маржи
+INITIAL_BALANCE_USD = 50.00     # Стартовый депозит: $50.00
+MARGIN_PCT_OF_BALANCE = 0.10    # 10% от текущего депозита на каждую сделку
+MIN_MARGIN_USD = 0.50           # Минимальный порог маржи
+MAX_MARGIN_USD = 200.0          # Защитный потолок маржи
 ASSUMED_LEVERAGE = 15           # Плечо 15x
 BYBIT_FEE_RATE = 0.0011         # Комиссия Bybit Futures: 0.11% за круг
 MAX_HOLD_HOURS = 48             # Принудительное закрытие через 48 часов
 PAIRS_LIMIT = 50                # Топ-50 пар Bybit для теста
 
-# Стратегические профили из прошлых тестов:
-# Профиль #1: TP +80% / SL -60%, без БУ
-# Профиль #2: TP +120% / SL -60%, ПлюсБУ +10%
+# Стратегические профили для сравнения:
 PROFILES_TO_TEST = [
     {"id": 1, "tp": 0.80, "sl": 0.60, "use_lock": False, "name": "Профиль #1 (TP +80% / без БУ)"},
-    {"id": 2, "tp": 1.20, "sl": 0.60, "use_lock": True,  "name": "Профиль #2 (TP +120% / с ПлюсБУ)"}
+    {"id": 2, "tp": 1.20, "sl": 0.60, "use_lock": True,  "name": "Профиль #2 (TP +120% / с ПлюсБУ +10%)"}
 ]
 
 MIN_BODY_PCT = 0.50             # Тело Heikin Ashi >= 0.50%
 MAX_WICK_PCT = 0.15             # Обратная тень <= 0.15%
-# ==============================================================================
+# ====================================================================================
 
 
 def calculate_heikin_ashi(ohlcv):
@@ -65,7 +62,7 @@ def calculate_ema(closes, period):
 
 
 async def get_affordable_bybit_symbols(exchange, all_swaps):
-    max_notional = MIN_MARGIN_USD * ASSUMED_LEVERAGE * 1.4
+    max_notional = MAX_MARGIN_USD * ASSUMED_LEVERAGE * 1.4
     affordable = []
     try:
         tickers = await exchange.fetch_tickers(all_swaps)
@@ -117,14 +114,12 @@ async def run_compounding_backtest():
             pass
 
     await exchange.close()
-    print(f"💾 Закешировано пар: {len(cached_market_data)}. Симулируем торговлю со сложным процентом...\n", flush=True)
+    print(f"💾 Закешировано пар: {len(cached_market_data)}. Симулируем разгон депозита со сложным процентом...\n", flush=True)
 
     if not cached_market_data:
         print("❌ Нет данных для анализа.", flush=True)
         return
 
-    # Собираем все события (сигналы) со всех пар и сортируем их по хронологии (timestamp),
-    # чтобы сложный процент пересчитывался последовательно во времени по всему рынку.
     all_potential_trades = []
 
     for sym, data in cached_market_data.items():
@@ -161,19 +156,20 @@ async def run_compounding_backtest():
                     "data": data
                 })
 
-    # Сортируем сделки по времени возникновения
     all_potential_trades.sort(key=lambda x: x["timestamp"])
 
-    print("="*90, flush=True)
-    print(f"📈 РЕЗУЛЬТАТЫ СИМУЛЯЦИИ СО СЛОЖНЫМ ПРОЦЕНТОМ (Старт депозита: ${INITIAL_BALANCE_USD:.2f}):", flush=True)
-    print("="*90, flush=True)
+    print("="*95, flush=True)
+    print(f"📈 РЕЗУЛЬТАТЫ РАЗГОНА ДЕПОЗИТА СО СЛОЖНЫМ ПРОЦЕНТОМ (Старт: ${INITIAL_BALANCE_USD:.2f}):", flush=True)
+    print("="*95, flush=True)
 
     for profile in PROFILES_TO_TEST:
         sim_balance = INITIAL_BALANCE_USD
         wins = 0
         losses = 0
         total_fees = 0.0
-        pair_busy_until = {}  # symbol -> idx до которого пара занята открытой сделкой
+        peak_balance = INITIAL_BALANCE_USD
+        max_drawdown_pct = 0.0
+        pair_busy_until = {}
 
         tp_pct = profile["tp"]
         sl_pct = profile["sl"]
@@ -183,15 +179,12 @@ async def run_compounding_backtest():
             sym = signal["symbol"]
             idx = signal["idx"]
 
-            # Защита от наслоения сделок на одной паре
             if idx <= pair_busy_until.get(sym, -1):
                 continue
 
-            # Расчет динамической маржи со сложным процентом
             raw_margin = sim_balance * MARGIN_PCT_OF_BALANCE
             trade_margin = max(MIN_MARGIN_USD, min(raw_margin, MAX_MARGIN_USD))
 
-            # Если баланс просел ниже маржи — пропускаем сделку
             if sim_balance < trade_margin:
                 continue
 
@@ -273,6 +266,13 @@ async def run_compounding_backtest():
             net_trade_pnl = trade_pnl_gross - fee_usd
             sim_balance += net_trade_pnl
 
+            if sim_balance > peak_balance:
+                peak_balance = sim_balance
+            
+            drawdown = (peak_balance - sim_balance) / peak_balance * 100.0
+            if drawdown > max_drawdown_pct:
+                max_drawdown_pct = drawdown
+
             if net_trade_pnl > 0:
                 wins += 1
             else:
@@ -287,12 +287,12 @@ async def run_compounding_backtest():
             f"🎯 {profile['name']}\n"
             f"   • Финальный баланс: <b>${sim_balance:.2f}</b> (Чистая прибыль: ${net_profit_usd:+.2f} | <b>{roi_pct:+.1f}%</b>)\n"
             f"   • Винрейт: {winrate:.1f}% (Побед: {wins} / Поражений: {losses} из {total_trades} сделок)\n"
-            f"   • Уплачено комиссий: ${total_fees:.2f}\n"
-            f"{'-'*90}",
+            f"   • Максимальная просадка: <b>{max_drawdown_pct:.1f}%</b> | Уплачено комиссий: ${total_fees:.2f}\n"
+            f"{'-'*95}",
             flush=True
         )
 
-    print("="*90, flush=True)
+    print("="*95, flush=True)
     print("⏸ Бэктест завершен. Ожидание...", flush=True)
     while True:
         await asyncio.sleep(3600)
