@@ -2,7 +2,6 @@ import ccxt
 import pandas as pd
 import numpy as np
 
-# Список из 20 ликвидных пар на Bybit
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
     'AVAX/USDT', 'DOGE/USDT', 'LINK/USDT', 'DOT/USDT', 'NEAR/USDT',
@@ -11,106 +10,120 @@ SYMBOLS = [
 ]
 
 def fetch_historical_data(exchange, symbol, timeframe='4h', limit=400):
-    """Загрузка исторических данных с Bybit"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"Ошибка загрузки {symbol}: {e}")
         return None
 
 def backtest_strategy(df, symbol):
-    """Логика бэктеста стратегии (структура + зоны спроса) для конкретной пары"""
     trades = []
-    initial_capital = 1000.0
+    initial_capital = 150.0  # Депозит $150
     capital = initial_capital
-    risk_per_trade = 0.02 # Риск 2% на сделку
+    
+    base_stake = 0.5         # Первоначальная сделка $0.5
+    max_steps = 4            # Мартингейл на 4 шага
+    current_step = 1
     
     in_position = False
     entry_price = 0
     stop_loss = 0
     take_profit = 0
     position_type = None
+    current_stake = 0
     
     for i in range(10, len(df)):
+        if capital <= 0:
+            break  # Если депозит полностью слит
+            
         current_close = df.loc[i, 'close']
         current_low = df.loc[i, 'low']
         current_high = df.loc[i, 'high']
         
         if not in_position:
-            # Ищем зону спроса (минимальные цены за последние 5 баров)
             recent_low = df.loc[i-5:i-1, 'low'].min()
-            recent_high = df.loc[i-5:i-1, 'high'].max()
             
-            # Условие входа в Лонг при откате к зоне спроса
+            # Условие входа в Лонг
             if current_low <= recent_low * 1.002:
                 in_position = True
                 position_type = 'LONG'
                 entry_price = current_close
-                stop_loss = recent_low * 0.993 # Стоп за зону с запасом
-                risk = entry_price - stop_loss
-                if risk <= 0:
+                stop_loss = recent_low * 0.993
+                risk_distance = entry_price - stop_loss
+                if risk_distance <= 0:
                     in_position = False
                     continue
-                take_profit = entry_price + (risk * 2.5) # R:R 1:2.5
+                take_profit = entry_price + (risk_distance * 2.5) # R:R 1:2.5
+                
+                # Рассчитываем размер ставки по шагам мартингейла (0.5 -> 1.0 -> 2.0 -> 4.0)
+                current_stake = base_stake * (2 ** (current_step - 1))
                 
         elif in_position:
             if position_type == 'LONG':
                 if current_low <= stop_loss:
-                    capital -= capital * risk_per_trade
+                    # Убыток: вычитаем текущую ставку из капитала
+                    capital -= current_stake
                     in_position = False
-                    trades.append({'result': 'LOSS'})
+                    trades.append({'result': 'LOSS', 'step': current_step})
+                    
+                    # Увеличиваем шаг мартингейла
+                    current_step += 1
+                    if current_step > max_steps:
+                        current_step = 1 # Сброс после 4 шагов
+                        
                 elif current_high >= take_profit:
-                    capital += capital * risk_per_trade * 2.5
+                    # Прибыль: при R:R 1:2.5 получаем ставку * 2.5
+                    profit = current_stake * 2.5
+                    capital += profit
                     in_position = False
-                    trades.append({'result': 'WIN'})
+                    trades.append({'result': 'WIN', 'step': current_step})
+                    
+                    # Сброс мартингейла при победе
+                    current_step = 1
                     
     wins = len([t for t in trades if t['result'] == 'WIN'])
     losses = len([t for t in trades if t['result'] == 'LOSS'])
     total = wins + losses
     winrate = (wins / total * 100) if total > 0 else 0
-    net_profit_pct = ((capital - initial_capital) / initial_capital) * 100
+    net_profit = capital - initial_capital
     
     return {
         'symbol': symbol,
         'trades': total,
-        'wins': wins,
-        'losses': losses,
         'winrate': winrate,
-        'profit_pct': net_profit_pct
+        'final_capital': capital,
+        'profit_usd': net_profit
     }
 
 def main():
     exchange = ccxt.bybit()
-    print(f"Запуск бэктеста для {len(SYMBOLS)} пар за ~60 дней (таймфрейм 4h)...\n")
+    print(f"Запуск бэктеста с Мартингейлом (4 шага, старт $150) для {len(SYMBOLS)} пар...\n")
     
     results = []
-    
     for symbol in SYMBOLS:
         df = fetch_historical_data(exchange, symbol, timeframe='4h', limit=400)
         if df is not None and not df.empty:
             res = backtest_strategy(df, symbol)
             results.append(res)
-            print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Доходность: {res['profit_pct']:+.2f}%")
+            print(f"[{symbol}] Сделок: {res['trades']} | Винрейт: {res['winrate']:.1f}% | Баланс: ${res['final_capital']:.2f} ({res['profit_usd']:+.2f}$)")
         else:
             print(f"[{symbol}] Пропущено (нет данных)")
             
-    # Общая сводка
     if results:
         df_res = pd.DataFrame(results)
-        print("\n" + "="*45)
-        print(" ИТОГОВАЯ СВОДКА ПО ВСЕМ ПАРАМ ")
-        print("="*45)
-        print(f"Всего протестировано пар: {len(df_res)}")
-        print(f"Средний винрейт по портфелю: {df_res['winrate'].mean():.2f}%")
-        print(f"Средняя доходность пассивного портфеля: {df_res['profit_pct'].mean():+.2f}%")
-        best_pair = df_res.loc[df_res['profit_pct'].idxmax()]
-        worst_pair = df_res.loc[df_res['profit_pct'].idxmin()]
-        print(f"Лучшая пара: {best_pair['symbol']} ({best_pair['profit_pct']:+.2f}%)")
-        print(f"Худшая пара: {worst_pair['symbol']} ({worst_pair['profit_pct']:+.2f}%)")
-        print("="*45)
+        print("\n" + "="*50)
+        print(" ИТОГОВАЯ СВОДКА (МАРТИНГЕЙЛ) ")
+        print("="*50)
+        print(f"Средний винрейт: {df_res['winrate'].mean():.2f}%")
+        print(f"Средний конечный баланс: ${df_res['final_capital'].mean():.2f}")
+        print(f"Общий финансовый результат по портфелю: {df_res['profit_usd'].sum():+.2f}$")
+        best = df_res.loc[df_res['profit_usd'].idxmax()]
+        worst = df_res.loc[df_res['profit_usd'].idxmin()]
+        print(f"Лучшая пара: {best['symbol']} ({best['profit_usd']:+.2f}$)")
+        print(f"Худшая пара: {worst['symbol']} ({worst['profit_usd']:+.2f}$)")
+        print("="*50)
 
 if __name__ == "__main__":
     main()
